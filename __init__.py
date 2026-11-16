@@ -7,8 +7,8 @@ Cursor's own permission requests are cancelled by the shim. When a model reaches
 native Cursor tool anyway, the fence refuses it and the same action is rerouted to the
 matching Hermes tool, so the user is not told to "fix permissions".
 
-Isolation: Cursor runs in an empty private workspace and is switched to ``ask`` mode
-(no edits, no command execution) so it cannot act on the repo by itself.
+Isolation: Cursor runs in a private workspace with native tools denied through
+``.cursor/cli.json``. This is a CLI permission fence, not an OS sandbox.
 
 Models: pick by bare name (``claude-opus-5-5``, ``gpt-5.6-sol``, ``composer-2.5``) or by
 the full advertised id (``claude-opus-5-5[context=300k,effort=high,fast=false]``).
@@ -20,6 +20,8 @@ import json
 import logging
 import os
 import re
+import shlex
+import shutil
 import threading
 from pathlib import Path
 from typing import Any
@@ -48,15 +50,26 @@ _HARNESS_OVERRIDE = (
     "as plain text using ONLY the tools listed below, then stop and wait: Hermes runs them and "
     "sends back the results in the next turn. If no tool is needed, answer directly.\n\n"
 )
-_FALLBACK_MODELS = (
-    "composer-2.5",
-    "claude-opus-5-5",
-    "claude-sonnet-5-5",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "grok-4.7",
-    "auto-smart",
-)
+
+
+def _resolve_cursor_command(command: str | None = None) -> str:
+    """Prefer Cursor's unique executable name over the shared ``agent`` name.
+
+    Grok also installs ``agent``. Keep explicit paths authoritative and retain
+    legacy Cursor installs, without letting a PATH collision hide the catalog.
+    """
+    override = command or next((os.environ[name].strip() for name in
+        ("HERMES_CURSOR_ACP_COMMAND", "CURSOR_AGENT_PATH") if os.environ.get(name, "").strip()), "")
+    if override:
+        return os.path.expanduser(override)
+    for name in ("cursor-agent", "agent"):
+        found = shutil.which(name)
+        if found:
+            return found
+        local = Path.home() / ".local" / "bin" / name
+        if local.is_file() and os.access(local, os.X_OK):
+            return str(local)
+    return "cursor-agent"
 
 
 def _workspace_dir() -> str:
@@ -331,7 +344,8 @@ def resolve_cursor_model(requested: str | None, available: list[dict[str, Any]])
     """Map a Hermes model string onto one advertised Cursor modelId.
 
     Order: exact id -> exact display name -> bare id (text before ``[``).
-    Returns None when nothing matches, so the session default is kept.
+    Full variant IDs must match exactly; do not silently change requested effort.
+    Returns None for defaults or unavailable models; the caller rejects the latter.
     """
     want = str(requested or "").strip()
     if not want or want in {"cursor", "cursor-acp", "cursor-agent", "cursor-cli", "default"}:
@@ -339,6 +353,8 @@ def resolve_cursor_model(requested: str | None, available: list[dict[str, Any]])
     ids = [str(m.get("modelId") or "") for m in available if isinstance(m, dict)]
     if want in ids:
         return want
+    if "[" in want:
+        return None
     for m in available:
         if isinstance(m, dict) and str(m.get("name") or "").strip() == want:
             return str(m.get("modelId"))
@@ -364,8 +380,9 @@ def _make_client_class():
             _write_deny_permissions(Path(cwd))
             self._native = threading.local()
             super().__init__(
-                acp_command=command or os.environ.get("HERMES_CURSOR_ACP_COMMAND", "").strip() or "agent",
-                acp_args=list(args or ["acp"]),
+                acp_command=_resolve_cursor_command(command),
+                acp_args=list((args if args is not None else
+                               shlex.split(os.environ.get("HERMES_CURSOR_ACP_ARGS", ""))) or ["acp"]),
                 acp_cwd=cwd,
                 **kwargs,
             )
@@ -412,9 +429,9 @@ def _make_client_class():
             with self._session(timeout_seconds, allow_file_requests=False) as (session, _):
                 seen: list[str] = []
                 for m in (session.get("models") or {}).get("availableModels") or []:
-                    name = _bare(str(m.get("modelId") or "")) if isinstance(m, dict) else ""
-                    if name and name not in seen:
-                        seen.append(name)
+                    model_id = m.get("modelId") if isinstance(m, dict) else None
+                    if isinstance(model_id, str) and model_id.strip() and model_id not in seen:
+                        seen.append(model_id)
                 return seen
 
         def _native_attempts(self) -> dict[str, dict[str, Any]]:
@@ -442,7 +459,7 @@ def _make_client_class():
                 if model and model_id is None and str(model).strip() not in {"cursor", "cursor-acp", "cursor-agent", "cursor-cli", "default"}:
                     raise RuntimeError(
                         f"Cursor does not offer model {model!r} on this account. "
-                        "Run `agent models` to see the list.")
+                        "Check /model in Hermes or run `cursor-agent models` to inspect Cursor availability.")
                 if model_id:
                     _set_model_with_retry(_request, session_id, model_id)
                 mode = os.environ.get("HERMES_CURSOR_ACP_MODE", _DEFAULT_MODE).strip()
@@ -498,10 +515,17 @@ class CursorACPProfile(ProviderProfile):
 
             creds = resolve_external_process_provider_credentials(self.name)
             client = self.create_client(command=creds.get("command"), args=creds.get("args"))
-            return client.list_models(timeout_seconds=timeout) or list(_FALLBACK_MODELS)
+            try:
+                models = client.list_models(timeout_seconds=timeout)
+                if not models:
+                    raise RuntimeError("Cursor ACP returned an empty model catalog")
+                return models
+            finally:
+                client.close()
         except Exception as exc:
-            logger.debug("cursor-acp fetch_models failed: %s", exc)
-            return list(_FALLBACK_MODELS)
+            logger.warning("cursor-acp model discovery failed: %s. Check the Cursor CLI and login; "
+                           "no static model list will be substituted.", exc)
+            return []
 
     def get_model_context_length(self, model: str) -> int | None:
         return 200_000
@@ -516,12 +540,12 @@ cursor_acp = CursorACPProfile(
     env_vars=(),
     base_url=CURSOR_MARKER_BASE_URL,
     auth_type="external_process",
-    process_command="agent",
+    process_command=_resolve_cursor_command(),
     process_args=("acp",),
     process_command_env_vars=("HERMES_CURSOR_ACP_COMMAND", "CURSOR_AGENT_PATH"),
     process_args_env_var="HERMES_CURSOR_ACP_ARGS",
     default_aux_model="composer-2.5",
-    fallback_models=_FALLBACK_MODELS,
+    fallback_models=(),
 )
 
 register_provider(cursor_acp)
