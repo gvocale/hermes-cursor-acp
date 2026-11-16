@@ -84,6 +84,14 @@ Fill out the PR template with the user-visible change and actual check results.
 Include failure cases, supported-platform effects, and docs changes; explain checks you did not run.
 Keep unrelated cleanup out. Do not include tokens, account details, private prompts, or unredacted tool output.
 Maintainers handle publishing; opening a PR does not require a version bump, npm credentials, or a release.
-`main` requires a pull request, one approval, resolved conversations, and the GitHub Actions `test` check on an up-to-date branch, including for administrators. Authors cannot approve their own PRs; maintainer-authored changes need another eligible reviewer.
-After merge, a maintainer explicitly runs the `release` workflow on `main`. A push alone does not publish with the updated workflow.
+`main` requires pull requests and one approval; only repository owner `neerazz` is exempt from the review and update-access restrictions.
+Other accounts retain those restrictions. Authors cannot approve their own PRs.
+Required CI, up-to-date branches, resolved conversations, and code-quality checks still apply to everyone, including the owner; force pushes and branch deletion remain blocked.
+
+After merge, a maintainer explicitly runs the `release` workflow on `main` and selects `registry`: `npm` (default) or `github`.
+A push alone does not publish. Both targets require successful CI for the selected commit.
+The `npm` target publishes the unscoped `hermes-cursor-acp` package and creates its tag and GitHub release.
+The `github` target publishes `@neerazz/hermes-cursor-acp` to GitHub Packages using `GITHUB_TOKEN` with `packages: write`; it does not publish to npm or create a tag or GitHub release.
+For GitHub Packages, the workflow chooses a version above the latest npm and GitHub versions and changes only the runner's manifest, preserving repository, homepage, license, description, and executable metadata.
+The source package stays unscoped; GitHub package downloads require separate npm authentication as described in the [README](README.md#github-packages-optional).
 For sensitive reports, use [SECURITY.md](SECURITY.md), not a public issue.
