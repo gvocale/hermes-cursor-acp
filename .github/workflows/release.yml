@@ -46,9 +46,14 @@ jobs:
       - name: Choose version
         id: version
         env:
-          GITHUB_PACKAGE_NAME: ${{ inputs.registry == 'github' && format('@{0}/hermes-cursor-acp', github.repository_owner) || '' }}
-          NODE_AUTH_TOKEN: ${{ inputs.registry == 'github' && github.token || '' }}
+          GITHUB_PACKAGE_NAME: "@${{ github.repository_owner }}/hermes-cursor-acp"
+          GITHUB_PACKAGES_TOKEN: ${{ github.token }}
         run: |
+          # Query both registries so a version never identifies two source commits.
+          # Keep this lookup-only auth config isolated from npm trusted publishing.
+          NPM_CONFIG_USERCONFIG=$(mktemp "$RUNNER_TEMP/version-registry.XXXXXX")
+          export NPM_CONFIG_USERCONFIG
+          printf '@%s:registry=https://npm.pkg.github.com\n//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}\n' "$GITHUB_REPOSITORY_OWNER" > "$NPM_CONFIG_USERCONFIG"
           VERSION=$(node scripts/next-version.js)
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
