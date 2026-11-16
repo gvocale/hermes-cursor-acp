@@ -1,0 +1,34 @@
+name: Bug report
+description: Report a reproducible installation, discovery, or tool-bridge failure.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "For vulnerabilities, use [private reporting](https://github.com/neerazz/hermes-cursor-acp/security/advisories/new). Remove tokens, account details, private prompts, and sensitive paths from all fields."
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions and environment
+      description: OS, Python, Node, Hermes version/commit, plugin version/commit, and Cursor CLI version. Include the selected executable path and any relevant overrides, redacted as needed.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Exact commands or Hermes steps, selected ACP model name/ID, and synthetic input. Say whether this is a mocked test or a real Cursor session.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual result and redacted output
+      description: Include the error and relevant output from `npx hermes-cursor-acp status`. Do not paste full conversations or credentials.
+    validations:
+      required: true

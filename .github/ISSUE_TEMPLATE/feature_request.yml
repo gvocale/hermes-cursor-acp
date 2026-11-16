@@ -1,0 +1,30 @@
+name: Feature request
+description: Propose a specific improvement to the Cursor ACP plugin.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: User goal
+      description: What task can you not complete today? Describe the current workflow and its limitation.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Proposed behavior and success check
+      description: Give a concrete example and how you would verify it works. Include relevant platforms or ACP models.
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Non-goals and compatibility
+      description: What should stay unchanged? Note effects on existing model names, CLI installation, permissions, or approvals.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives tried
+      description: Optional workarounds or related issues. Do not include secrets or private prompts.

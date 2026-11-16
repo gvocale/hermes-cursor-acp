@@ -1,0 +1,6 @@
+# Dependencies for offline tests against the pinned Hermes source.
+pytest>=8.3,<10
+pytest-cov>=6,<8
+openai>=1.0,<3
+ruamel.yaml>=0.18,<0.19
+python-dotenv>=1,<2

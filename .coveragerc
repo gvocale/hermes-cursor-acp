@@ -1,0 +1,9 @@
+[run]
+omit =
+    tests/*
+    .hermes-agent/*
+    .venv/*
+
+[report]
+fail_under = 90
+show_missing = True

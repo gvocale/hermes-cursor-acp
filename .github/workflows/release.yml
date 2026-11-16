@@ -1,11 +1,8 @@
 name: release
 
-# Every push to main: test, pick the next version, publish to npm, tag the commit.
+# Explicit maintainer dispatch only: test main, publish to npm, tag the commit.
 # Publishing uses npm trusted publishing (GitHub OIDC), so the repo stores no npm token.
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
 
 concurrency:
@@ -15,47 +12,14 @@ concurrency:
 permissions:
   contents: read
 
-env:
-  HERMES_AGENT_REF: main
-
 jobs:
   test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/checkout@v4
-        with:
-          repository: NousResearch/hermes-agent
-          ref: ${{ env.HERMES_AGENT_REF }}
-          path: .hermes-agent
-          fetch-depth: 1
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "24"
-
-      - name: Python tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}/.hermes-agent:${{ github.workspace }}
-        run: |
-          pip install pytest openai "ruamel.yaml"
-          pytest tests -q -o addopts=
-
-      - name: CLI smoke
-        run: |
-          node --check bin/cli.js
-          node --check scripts/next-version.js
-          node bin/cli.js help
-          npm pack --dry-run
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
 
   publish:
     needs: test
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write   # push the vX.Y.Z tag
