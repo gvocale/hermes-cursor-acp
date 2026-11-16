@@ -40,7 +40,7 @@ def test_github_lookup_failure_never_becomes_a_first_release(tmp_path, failure):
     assert "version: 0.1.0" in (tmp_path / "plugin.yaml").read_text()
 
 
-def run_version(tmp_path, local, npm_version, github_version):
+def run_version(tmp_path, local, npm_version, github_version, *, workflow_step=False):
     (tmp_path / "package.json").write_text(json.dumps({"name": "hermes-cursor-acp", "version": local}))
     (tmp_path / "plugin.yaml").write_text(f"name: cursor-acp\nversion: {local}\n")
     bindir = tmp_path / "bin"
@@ -67,11 +67,32 @@ def run_version(tmp_path, local, npm_version, github_version):
         env.update(GITHUB_PACKAGE_NAME="@neerazz/hermes-cursor-acp", GITHUB_VERSION=github_version)
     node = shutil.which("node")
     assert node, "Node is required for release tests"
+    command = [node, str(ROOT / "scripts/next-version.js")]
+    if workflow_step:
+        (tmp_path / "scripts").mkdir()
+        shutil.copyfile(ROOT / "scripts/next-version.js", tmp_path / "scripts/next-version.js")
+        workflow = YAML(typ="safe").load((ROOT / ".github/workflows/release.yml").read_text())
+        step = next(s for s in workflow["jobs"]["publish"]["steps"] if s.get("name") == "Choose version")
+        env.update(RUNNER_TEMP=str(tmp_path), GITHUB_REPOSITORY_OWNER="neerazz", GITHUB_OUTPUT=str(tmp_path / "outputs"))
+        env["PATH"] += f":{Path(node).parent}"
+        command = ["/bin/bash", "-e", "-c", step["run"]]
     result = subprocess.run(
-        [node, str(ROOT / "scripts/next-version.js")], cwd=tmp_path,
+        command, cwd=tmp_path,
         env=env, capture_output=True, text=True, timeout=10,
     )
     return result, (tmp_path / "calls").read_text()
+
+
+def test_workflow_version_lookup_reserves_versions_across_both_registries(tmp_path):
+    result, calls = run_version(tmp_path, "0.1.0", "0.1.4", "0.1.5", workflow_step=True)
+    assert result.returncode == 0, result.stderr
+    assert "version=0.1.6" in (tmp_path / "outputs").read_text()
+    assert "https://registry.npmjs.org" in calls and "https://npm.pkg.github.com" in calls
+    configs = list(tmp_path.glob("version-registry.*"))
+    assert len(configs) == 1
+    config = configs[0].read_text()
+    assert "//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}" in config
+    assert "//registry.npmjs.org/:_authToken" not in config
 
 
 def test_version_failure_stops_the_release_shell_step(tmp_path):
@@ -85,7 +106,7 @@ def test_version_failure_stops_the_release_shell_step(tmp_path):
     output = tmp_path / "outputs"
     result = subprocess.run(
         ["/bin/bash", "-e", "-c", step["run"]], cwd=tmp_path,
-        env={"PATH": f"{Path(node).parent}:/usr/bin:/bin", "GITHUB_OUTPUT": str(output)},
+        env={"PATH": f"{Path(node).parent}:/usr/bin:/bin", "GITHUB_OUTPUT": str(output), "RUNNER_TEMP": str(tmp_path), "GITHUB_REPOSITORY_OWNER": "neerazz"},
         capture_output=True, text=True, timeout=10,
     )
     assert result.returncode == 19
@@ -108,6 +129,10 @@ def test_release_stays_manual_main_only_and_ci_gated():
     assert steps["Publish to GitHub Packages"]["if"] == "inputs.registry == 'github'"
     assert job["permissions"]["packages"] == "write"
     assert steps["Publish to GitHub Packages"]["env"]["NODE_AUTH_TOKEN"] == "${{ github.token }}"
+    assert steps["Choose version"]["env"]["GITHUB_PACKAGE_NAME"] == "@${{ github.repository_owner }}/hermes-cursor-acp"
+    assert steps["Choose version"]["env"]["GITHUB_PACKAGES_TOKEN"] == "${{ github.token }}"
+    assert "NODE_AUTH_TOKEN" not in steps["Choose version"]["env"], "Never send the GitHub token to npmjs.com"
+    assert "//npm.pkg.github.com/:_authToken=${GITHUB_PACKAGES_TOKEN}" in steps["Choose version"]["run"]
     assert "https://npm.pkg.github.com" in steps["Publish to GitHub Packages"]["run"]
     assert "npm exec" in steps["Verify GitHub package download"]["run"]
     assert "hermes-cursor-acp help" in steps["Verify GitHub package download"]["run"]
