@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+live = pytest.mark.skipif(os.environ.get("CURSOR_LIVE") != "1", reason="set CURSOR_LIVE=1 to hit the real Cursor CLI")
 
 
 @pytest.fixture(scope="module")
@@ -42,7 +43,7 @@ AVAILABLE = [
     [
         ("claude-opus-5-5", "claude-opus-5-5[context=300k,effort=medium,fast=false]"),
         ("composer-2.5[fast=true]", "composer-2.5[fast=true]"),
-        ("gpt-5.6-sol[reasoning=high]", "gpt-5.6-sol[context=272k,reasoning=medium,fast=false]"),
+        ("gpt-5.6-sol[reasoning=high]", None),
         ("cursor", None),
         ("", None),
         ("not-a-model", None),
@@ -50,6 +51,17 @@ AVAILABLE = [
 )
 def test_resolve_cursor_model(plugin, requested, expected):
     assert plugin.resolve_cursor_model(requested, AVAILABLE) == expected
+
+
+@pytest.mark.parametrize("requested,expected", [
+    ("family", "family[effort=low]"),
+    ("family[effort=high]", "family[effort=high]"),
+    ("High effort", "family[effort=high]"),
+])
+def test_model_selection_preserves_exact_variant_and_bare_name_compatibility(plugin, requested, expected):
+    variants = [{"modelId": "family[effort=low]", "name": "Low effort"},
+                {"modelId": "family[effort=high]", "name": "High effort"}]
+    assert plugin.resolve_cursor_model(requested, variants) == expected
 
 
 def test_profile_registered_as_external_process(plugin):
@@ -60,7 +72,220 @@ def test_profile_registered_as_external_process(plugin):
     assert "cursor-subscription" not in p.aliases
     assert p.auth_type == "external_process"
     assert p.base_url.startswith("acp://")
-    assert p.process_command == "agent" and tuple(p.process_args) == ("acp",)
+    assert p.process_command == plugin._resolve_cursor_command() and tuple(p.process_args) == ("acp",)
+
+
+@pytest.mark.parametrize("override", ["HERMES_CURSOR_ACP_COMMAND", "CURSOR_AGENT_PATH"])
+def test_client_honors_cursor_command_overrides(plugin, tmp_path, monkeypatch, override):
+    monkeypatch.delenv("HERMES_CURSOR_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("CURSOR_AGENT_PATH", raising=False)
+    monkeypatch.setenv(override, "/custom/cursor")
+    client = plugin._make_client_class()(acp_cwd=str(tmp_path))
+    assert client._acp_command == "/custom/cursor"
+    client.close()
+
+
+def test_default_command_prefers_cursor_agent_over_unrelated_agent(plugin, tmp_path, monkeypatch):
+    import shutil
+
+    monkeypatch.delenv("HERMES_CURSOR_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("CURSOR_AGENT_PATH", raising=False)
+    monkeypatch.setattr(shutil, "which", lambda name: {
+        "cursor-agent": "/cursor/bin/cursor-agent", "agent": "/grok/bin/agent"}.get(name))
+    client = plugin._make_client_class()(acp_cwd=str(tmp_path))
+    assert client._acp_command == "/cursor/bin/cursor-agent"
+    client.close()
+
+
+def test_default_command_finds_cursor_in_user_local_bin(plugin, tmp_path, monkeypatch):
+    import shutil
+
+    monkeypatch.delenv("HERMES_CURSOR_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("CURSOR_AGENT_PATH", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    cli = tmp_path / ".local" / "bin" / "cursor-agent"
+    cli.parent.mkdir(parents=True)
+    cli.write_text("#!/bin/sh\nexit 0\n")
+    cli.chmod(0o755)
+    client = plugin._make_client_class()(acp_cwd=str(tmp_path / "ws"))
+    assert client._acp_command == str(cli)
+    client.close()
+
+
+def test_legacy_agent_remains_supported(plugin, tmp_path, monkeypatch):
+    import shutil
+
+    monkeypatch.delenv("HERMES_CURSOR_ACP_COMMAND", raising=False)
+    monkeypatch.delenv("CURSOR_AGENT_PATH", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda name: "/legacy/agent" if name == "agent" else None)
+    client = plugin._make_client_class()(acp_cwd=str(tmp_path))
+    assert client._acp_command == "/legacy/agent"
+    client.close()
+
+
+def test_explicit_command_wins_over_environment(plugin, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_ACP_COMMAND", "/env/cursor")
+    client = plugin._make_client_class()(command="/explicit/cursor", acp_cwd=str(tmp_path))
+    assert client._acp_command == "/explicit/cursor"
+    client.close()
+
+
+def test_direct_client_honors_cursor_args_not_copilot_args(plugin, tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_CURSOR_ACP_ARGS", 'acp --flag "two words"')
+    monkeypatch.setenv("HERMES_COPILOT_ACP_ARGS", "--wrong")
+    client = plugin._make_client_class()(command="/custom/cursor", acp_cwd=str(tmp_path))
+    assert client._acp_args == ["acp", "--flag", "two words"]
+    client.close()
+
+
+@pytest.mark.parametrize("copilot_args", [None, "--wrong-copilot-args"])
+def test_empty_explicit_args_keep_cursor_defaults(plugin, tmp_path, monkeypatch, copilot_args):
+    monkeypatch.setenv("HERMES_CURSOR_ACP_ARGS", "acp --cursor-env-flag")
+    if copilot_args is None:
+        monkeypatch.delenv("HERMES_COPILOT_ACP_ARGS", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_COPILOT_ACP_ARGS", copilot_args)
+    client = plugin._make_client_class()(command="/cursor", args=[], acp_cwd=str(tmp_path))
+    try:
+        assert client._acp_args == ["acp"]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("result", [[], RuntimeError("discovery unavailable"), ["brand-new-model", "composer-2.5"]])
+def test_fetch_models_returns_only_live_catalog_and_closes_client(plugin, monkeypatch, caplog, result):
+    from types import SimpleNamespace
+
+    closed = []
+
+    def list_models(**kwargs):
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    client = SimpleNamespace(list_models=list_models, close=lambda: closed.append(True))
+    monkeypatch.setattr(plugin.CursorACPProfile, "create_client", lambda *a, **k: client)
+    monkeypatch.setattr("hermes_cli.auth.resolve_external_process_provider_credentials",
+                        lambda name: {"command": "/cursor", "args": ["acp"]})
+    assert plugin.cursor_acp.fetch_models() == (result if isinstance(result, list) else [])
+    assert closed == [True]
+    if not result or isinstance(result, Exception):
+        assert "cursor-acp" in caplog.text and "discover" in caplog.text.lower()
+    assert not plugin.cursor_acp.fallback_models
+
+
+def test_fetch_models_refreshes_instead_of_freezing_first_catalog(plugin, monkeypatch):
+    from types import SimpleNamespace
+
+    catalogs = iter([["composer-2.5"], ["composer-2.5", "newly-released"]])
+    monkeypatch.setattr(plugin.CursorACPProfile, "create_client", lambda *a, **k: SimpleNamespace(
+        list_models=lambda **_: next(catalogs), close=lambda: None))
+    monkeypatch.setattr("hermes_cli.auth.resolve_external_process_provider_credentials",
+                        lambda name: {"command": "/cursor", "args": ["acp"]})
+    assert plugin.cursor_acp.fetch_models() == ["composer-2.5"]
+    assert plugin.cursor_acp.fetch_models() == ["composer-2.5", "newly-released"]
+
+
+def test_list_models_preserves_variants_ignores_bad_rows_and_deduplicates(plugin, tmp_path, monkeypatch):
+    import contextlib
+
+    client = plugin._make_client_class()(command="/cursor", acp_cwd=str(tmp_path))
+
+    @contextlib.contextmanager
+    def session(timeout_seconds, **kwargs):
+        assert timeout_seconds == 7 and kwargs["allow_file_requests"] is False
+        yield {"models": {"availableModels": [
+            {"modelId": "brand-new[effort=high]"}, {"modelId": "brand-new[effort=low]"},
+            {"modelId": "brand-new[effort=high]"}, {"modelId": "next-model"},
+            {"name": "no-id"}, None, "bad-row", {"modelId": ""}, {"modelId": 123},
+        ]}}, None
+
+    monkeypatch.setattr(client, "_session", session)
+    try:
+        assert client.list_models(timeout_seconds=7) == [
+            "brand-new[effort=high]", "brand-new[effort=low]", "next-model"]
+    finally:
+        client.close()
+
+
+def test_credential_discovery_failure_is_visible(plugin, monkeypatch, caplog):
+    def fail(name):
+        raise RuntimeError("Cursor command unavailable")
+
+    monkeypatch.setattr("hermes_cli.auth.resolve_external_process_provider_credentials", fail)
+    assert plugin.cursor_acp.fetch_models() == []
+    assert "Cursor command unavailable" in caplog.text
+
+
+@pytest.mark.parametrize("requested", ["not-a-model", "composer-2.5[unsupported=true]"])
+def test_unknown_model_fails_before_prompt_or_model_selection(plugin, tmp_path, monkeypatch, requested):
+    client, prompts = _scripted_client(plugin, tmp_path, monkeypatch, [])
+    try:
+        with pytest.raises(RuntimeError, match="does not offer model"):
+            client.chat.completions.create(model=requested, messages=[{"role": "user", "content": "hi"}])
+        assert prompts == []
+    finally:
+        client.close()
+
+
+def test_command_override_precedence_and_expansion(plugin, tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_CURSOR_ACP_COMMAND", "  /first/cursor  ")
+    monkeypatch.setenv("CURSOR_AGENT_PATH", "/second/cursor")
+    assert plugin._resolve_cursor_command() == "/first/cursor"
+    monkeypatch.setenv("HERMES_CURSOR_ACP_COMMAND", "   ")
+    assert plugin._resolve_cursor_command() == "/second/cursor"
+
+
+@live
+def test_live_profile_catalog_matches_fresh_acp_session(plugin):
+    from hermes_cli.models import provider_model_ids
+
+    client = plugin._make_client_class()()
+    try:
+        # Compare the consumer against raw protocol data, not the same list parser twice.
+        with client._session(30, allow_file_requests=False) as (session, _):
+            expected = [row["modelId"] for row in session["models"]["availableModels"]]
+    finally:
+        client.close()
+    actual = plugin.cursor_acp.fetch_models(timeout=30)
+    assert expected and set(actual) == set(expected)
+    assert set(provider_model_ids("cursor-acp", force_refresh=True)) == set(expected)
+
+
+@pytest.mark.parametrize("mode", ["collision", "override", "legacy", "local"])
+def test_npx_status_uses_cursor_not_unrelated_agent(tmp_path, mode):
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    assert node, "Node is required to test the shipped npx installer"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, label in [("hermes", "HERMES_OK"), ("agent", "WRONG_AGENT"),
+                        ("cursor-agent", "CURSOR_MODELS_OK"), ("custom-cursor", "CUSTOM_CURSOR_OK")]:
+        cli = bindir / name
+        cli.write_text(f"#!/bin/sh\nprintf '%s\\n' '{label}'\n")
+        cli.chmod(0o755)
+    if mode == "legacy":
+        (bindir / "cursor-agent").unlink()
+    if mode == "local":
+        local = tmp_path / ".local" / "bin"
+        local.mkdir(parents=True)
+        (bindir / "cursor-agent").rename(local / "cursor-agent")
+    env = {"PATH": str(bindir) + os.pathsep + "/usr/bin:/bin", "HOME": str(tmp_path)}
+    if mode == "override":
+        env["CURSOR_AGENT_PATH"] = str(bindir / "custom-cursor")
+    proc = subprocess.run([node, str(ROOT / "bin" / "cli.js"), "status"], env=env,
+                          capture_output=True, text=True, timeout=15)
+    assert proc.returncode == 0, proc.stderr
+    if mode == "legacy":
+        assert "WRONG_AGENT" in proc.stdout
+    else:
+        assert ("CUSTOM_CURSOR_OK" if mode == "override" else "CURSOR_MODELS_OK") in proc.stdout
+        assert "WRONG_AGENT" not in proc.stdout
 
 
 def test_existing_cli_json_is_backed_up_before_overwrite(plugin, tmp_path):
@@ -120,9 +345,6 @@ def test_usage_is_none_so_hermes_marks_provider_usage_less(plugin, tmp_path, mon
     record_response_usage(agent, resp, messages=[], api_call_count=1, api_duration=0.1,
                           compression_attempts=0, max_compression_attempts=3)
     assert noted == [True]
-
-
-live = pytest.mark.skipif(os.environ.get("CURSOR_LIVE") != "1", reason="set CURSOR_LIVE=1 to hit the real Cursor CLI")
 
 
 @pytest.mark.parametrize(

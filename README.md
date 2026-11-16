@@ -1,82 +1,66 @@
 # hermes-cursor-acp
 
-Use your Cursor subscription models (Claude, GPT, Grok, Gemini, Composer) as the model behind [Hermes Agent](https://github.com/NousResearch/hermes-agent).
-
-Cursor doesn't expose a chat-completions API, but the Cursor CLI ships an ACP server (`agent acp`). This plugin drives it through Hermes' ACP shim. Hermes keeps its own tools, memory, and skills. Cursor only supplies the model.
-
-## How it works
-
-- Hermes tool schemas go to the model as text. The model replies with `<tool_call>` blocks, and Hermes runs those calls itself. The plugin parses them with its own extractor, because Hermes' built-in bridge silently drops three shapes models emit: the flat `{"name", "arguments"}` form, a real block that follows a mention of `<tool_call>` in prose, and call JSON with no tags at all.
-- Models still reach for Cursor's own Shell, Read, Grep, or MCP tools, most often the GLM, Kimi, and DeepSeek families. The fence refuses the call, and the model then tells you to fix permissions. The plugin reads the refused call from the ACP stream and runs the same action through the matching Hermes tool, so Hermes' approvals still apply. If no Hermes tool matches, it re-prompts the model once.
-- The plugin rewrites `.cursor/cli.json` in an empty private workspace (`$HERMES_HOME/cache/cursor-acp-workspace`) every time a client starts, with a deny-all list (`Read`, `Write`, `Shell`, `WebFetch`, `Mcp`). This deny list is the security fence. Cursor's native tools run inside the CLI rather than over ACP, and without the list its Read tool can open any absolute path on disk.
-- Models can be chosen by bare name (`claude-opus-5-5`) or by full advertised id (`claude-opus-5-5[context=300k,effort=high,fast=false]`). An unknown name raises an error instead of silently using Cursor's default.
-- Responses report `usage=None`. Cursor sends no token counts, and a zero reading would stall Hermes' proactive context compression.
+Use Cursor subscription models in [Hermes Agent](https://github.com/NousResearch/hermes-agent) through the Cursor CLI's ACP server.
+Hermes keeps its tools, approvals, memory, and skills. Cursor supplies the model.
 
 ## Install
 
-### Option 1: One-command install (recommended)
+Requires macOS or Linux, Python 3.11+, Node.js 18+, Hermes on `PATH`, and a Cursor account with model access.
+Install [Hermes](https://hermes-agent.nousresearch.com/docs) and the [Cursor CLI](https://cursor.com/cli) first, then:
 
 ```bash
+cursor-agent login
 npx hermes-cursor-acp
 ```
 
-This installs and enables the plugin in Hermes, verifies your Cursor CLI (`agent`) installation, and checks that your subscription models are accessible.
-
-### Option 2: Manual install
-
-```bash
-curl https://cursor.com/install -fsS | bash   # Cursor CLI
-agent login                                   # sign in with your Cursor account
-agent models                                  # confirm what your plan offers
-
-git clone git@github.com:neerazz/hermes-cursor-acp.git ~/.hermes/plugins/cursor-acp
-hermes plugins enable cursor-acp
-```
-
-## Use
+The npm command delegates plugin installation and enablement to Hermes; it does not handle API keys.
+Cursor manages your login. Older Cursor installations may use `agent` instead of `cursor-agent`.
+For a direct install without npm:
 
 ```bash
-hermes --provider cursor-acp -m claude-opus-5-5
+hermes plugins install https://github.com/neerazz/hermes-cursor-acp --enable
 ```
 
-Or run `/model` inside Hermes and pick **Cursor Subscription (ACP)**.
+## Choose a model
 
-## Settings (env)
+Open `/model` in Hermes and choose **Cursor Subscription (ACP)**.
+The plugin discovers exact model IDs from the live ACP catalog, including variant parameters; it does not maintain a fixed model list.
+Use an ID shown there with `hermes --provider cursor-acp -m 'MODEL_ID'`, replacing `MODEL_ID` and keeping the quotes.
+Existing bare model names still select the first advertised variant. A qualified ID must match exactly; unknown IDs fail instead of silently selecting another variant.
+CLI `models` output can contain marketing aliases that ACP does not accept.
+If discovery fails, the plugin warns and returns an empty list rather than inventing fallback models.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `HERMES_CURSOR_ACP_COMMAND` | `agent` | Path to the Cursor CLI |
-| `HERMES_CURSOR_ACP_ARGS` | `acp` | Argv tail |
-| `HERMES_CURSOR_ACP_MODE` | `agent` | Cursor session mode. `ask` made gpt-5.6-sol refuse the bridge 2 times in 5. |
-| `HERMES_CURSOR_ACP_CWD` | `$HERMES_HOME/cache/cursor-acp-workspace` | Private workspace |
+## What works, and what does not
 
-## Tests
+Hermes executes bridged tool calls under its own approvals. Some models refuse the bridge or emit unusable calls; task completion is not guaranteed.
+Cursor's native tools are denied through `.cursor/cli.json` in a private workspace.
+This is a CLI permission boundary, **not an OS sandbox**, and future Cursor changes could break it.
+Conversation text, tool schemas, and tool results sent to the model pass through Cursor.
+Each turn starts a new ACP session, which adds latency. Cursor provides no token or cost counts, so Hermes usage reports undercount.
+
+## Troubleshoot
 
 ```bash
-H=~/.hermes/hermes-agent
-PYTHONPATH=$H uv run --no-project --python $H/venv/bin/python --with pytest python -m pytest tests -q -o addopts=
-CURSOR_LIVE=1 ...   # adds live tests against the real CLI (needs `agent login`)
-CURSOR_LIVE=1 CURSOR_LIVE_MODELS="glm-5p3,kimi-k3" CURSOR_LIVE_TRIALS=3 ... -k two_step   # two-step task per model
+npx hermes-cursor-acp status
+cursor-agent models
 ```
 
-Live results on 2026-11-10 (Hermes v0.23.1, Cursor CLI 2026.10.22), driven through the plugin client:
+`status` shows the selected executable and plugin state; `models` checks CLI access, not ACP ID compatibility.
+Executable lookup order: `HERMES_CURSOR_ACP_COMMAND`, `CURSOR_AGENT_PATH`, `cursor-agent` on `PATH`, `~/.local/bin/cursor-agent`, legacy `agent` on `PATH`, then `~/.local/bin/agent`.
+If `agent` belongs to another product, set `HERMES_CURSOR_ACP_COMMAND` to the absolute Cursor CLI path before running the installer and Hermes.
+For an empty catalog, confirm that executable, run its `login` command, and retry discovery in Hermes.
+Do not allow Cursor native tools to work around a bridge failure; report a redacted reproduction instead.
 
-- Two-step task (read a random value, compute from it, run a second command), 3 runs per model: deepseek-v41-flash-1017 3/3, glm-5p3 3/3, glm-5p3-flash 3/3, glm-5.2 3/3, kimi-k3 3/3, kimi-k2.7-code 2/3. Most GLM and DeepSeek runs passed only because a refused native call was rerouted.
-- The same task, 2 runs per model: claude-sonnet-5-5, gpt-5.6-sol, grok-4.7, composer-2.5, gemini-4-carbon, and auto-smart all 2/2.
+| Optional environment variable | Default / effect |
+| --- | --- |
+| `HERMES_CURSOR_ACP_ARGS` | `acp`; arguments passed to the Cursor CLI |
+| `HERMES_CURSOR_ACP_MODE` | `agent`; Cursor session mode |
+| `HERMES_CURSOR_ACP_CWD` | `$HERMES_HOME/cache/cursor-acp-workspace`; keep this separate from your projects because the plugin rewrites its `.cursor/cli.json` |
 
-Live results on 2026-10-06 (Hermes v0.21.5, Cursor CLI 2026.10.01):
+Remove the plugin with `npx hermes-cursor-acp uninstall`.
 
-- Hermes tool-call bridging over 6 trials per model: claude-sonnet-5-5 6/6, claude-opus-5-5 6/6, composer-2.5 6/6, grok-4.7 6/6, gpt-5.6-sol 5/6. The one gpt miss answered from context without calling the tool.
-- Fence probes sent as raw prompts, so the model was told to escape: Cursor's native Read, Grep, Shell, Write, and WebFetch were all blocked. The canary file content and a live GitHub SHA never came back.
-- End-to-end multi-step runs through `hermes chat` (read_file, then terminal) executed both tools for real with composer-2.5 and gpt-5.6-sol.
+## Contribute or report a problem
 
-## Known limits
-
-- Every turn starts a new ACP session. That adds 7–16s of latency and about 17k tokens of Cursor's harness prompt.
-- Hermes records no token or cost data for these calls, so `/usage` and `/insights` undercount.
-- When several sessions start at once, Cursor occasionally answers `set_model` with `Internal error`. The plugin retries up to 3 times.
-- kimi-k2.7-code sometimes refuses the bridge in plain text without trying any tool. There is no call to reroute, so that turn ends with no action.
-
-## License
-
-MIT
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local tests and pull requests.
+Use [bug reports and feature requests](https://github.com/neerazz/hermes-cursor-acp/issues/new/choose) for non-sensitive issues.
+Report vulnerabilities privately through [SECURITY.md](SECURITY.md). Licensed under [MIT](LICENSE).
