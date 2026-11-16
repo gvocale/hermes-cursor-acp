@@ -21,6 +21,23 @@ For a direct install without npm:
 hermes plugins install https://github.com/neerazz/hermes-cursor-acp --enable
 ```
 
+## GitHub Packages (optional)
+
+`npx hermes-cursor-acp` from npm remains the primary install and needs no GitHub login.
+The [GitHub package](https://github.com/neerazz/hermes-cursor-acp/pkgs/npm/hermes-cursor-acp) uses the separate name `@neerazz/hermes-cursor-acp`.
+GitHub requires authentication even for public package downloads: use a personal access token (classic) with `read:packages` as the password when prompted.
+Authenticate through npm, then run either scoped command:
+
+```bash
+npm login --scope=@neerazz --auth-type=legacy --registry=https://npm.pkg.github.com
+npx --registry=https://npm.pkg.github.com @neerazz/hermes-cursor-acp
+# Equivalent npm exec command:
+npm exec --registry=https://npm.pkg.github.com --package=@neerazz/hermes-cursor-acp -- hermes-cursor-acp
+```
+
+Keep the token in npm's authentication configuration; never pass it to the plugin or commit it.
+The plugin does not collect GitHub credentials. See [GitHub's npm registry documentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-npm-registry) for authentication details.
+
 ## Choose a model
 
 Open `/model` in Hermes and choose **Cursor Subscription (ACP)**.
