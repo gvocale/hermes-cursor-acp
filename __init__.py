@@ -56,6 +56,8 @@ _PROMPT_ECHO_BOUNDARY_RE = re.compile(
     rf"(?m)^(?:Tool result(?: \([^\n)]+\))?:|{_TOOL_CALL_OPEN_PATTERN})",
     re.IGNORECASE,
 )
+_ASSISTANT_LINE_PREFIX_RE = re.compile(r"^[ \t]*Assistant:[ \t]*(?:\r?\n)?")
+_FENCE_LINE_RE = re.compile(r"^[ \t]*(?:```|~~~)")
 _ROLE_LINE_TOKEN_RE = re.compile(r"^[^\s<>{}()\[\].,;!?:'\"`]{1,32}$")
 _HARNESS_WRAPPER_ECHO_RE = re.compile(
     r"^\s*(?:[^\s<>{}()\[\].,;!?:'\"`]{1,32}\r?\n)?"
@@ -231,7 +233,7 @@ def _extract_images_from_messages(messages: list[dict[str, Any]]) -> list[dict[s
 def _render_message(msg: dict[str, Any]) -> str:
     """Render one transcript message, including the assistant's prior tool calls so the model
     sees its own <tool_call> history (the parent shim drops them, which breaks multi-step turns)."""
-    role = str(msg.get("role") or "user").lower()
+    role = str(msg.get("role") or "context").lower()
     parts = [_render_content(msg.get("content"))]
     for call in msg.get("tool_calls") or []:
         fn = (call.get("function") if isinstance(call, dict) else getattr(call, "function", None)) or {}
@@ -246,11 +248,11 @@ def _render_message(msg: dict[str, Any]) -> str:
              "type": "function", "function": {"name": name, "arguments": args if isinstance(args, str)
                                                else json.dumps(args_obj, ensure_ascii=False)}},
             ensure_ascii=False) + "</tool_call>")
-    label = _ROLE_LABELS.get(role, "Context")
+    attrs = f'role="{role}"'
     if role == "tool" and msg.get("name"):
-        label = f"Tool result ({msg['name']})"
+        attrs += f' name="{msg[\"name\"]}"'
     body = "\n".join(p for p in parts if p)
-    return f"{label}:\n{body}" if body else ""
+    return f"<turn {attrs}>\n{body}\n</turn>" if body else ""
 
 
 def _format_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, tool_choice: Any) -> str:
@@ -265,14 +267,14 @@ def _format_prompt(messages: list[dict[str, Any]], tools: list[dict[str, Any]] |
     names = [s["name"] for s in tool_specs_from_openai_tools(tools)]
     if names:
         sections.append(
-            "Now continue as the Assistant. The tools you CAN use are exactly: " + ", ".join(names) + ". "
+            "Respond to the latest turn. The tools you CAN use are exactly: " + ", ".join(names) + ". "
             "They are real and wired: Hermes executes them on the user's machine when you emit "
             "<tool_call>{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"<tool>\", "
             "\"arguments\": \"<JSON string>\"}}</tool_call>. If the task needs one, "
             "emit the block now and stop. Do not claim a tool is unavailable, and do not use Cursor's "
             "built-in tools; they are refused.")
     else:
-        sections.append("Now continue as the Assistant. No tools are available this turn; answer directly.")
+        sections.append("Respond directly to the latest turn. No tools are available this turn.")
     return "\n\n".join(s.strip() for s in sections if s and s.strip())
 
 
@@ -284,12 +286,12 @@ def _format_delta_prompt(delta_messages: list[dict[str, Any]], tool_names: list[
         sections.append("\n\n".join(transcript))
     if tool_names:
         sections.append(
-            "Now continue as the Assistant. The tools you CAN use are exactly: " + ", ".join(tool_names) + ". "
+            "Continue the response. The tools you CAN use are exactly: " + ", ".join(tool_names) + ". "
             "Emit <tool_call>{\"id\": \"call_1\", \"type\": \"function\", \"function\": {\"name\": \"<tool>\", "
             "\"arguments\": \"<JSON string>\"}}</tool_call> if another tool is needed, or answer directly. "
             "Do not use Cursor's built-in tools; they are refused.")
     else:
-        sections.append("Now continue as the Assistant. Answer directly.")
+        sections.append("Continue the response directly.")
     return "\n\n".join(s.strip() for s in sections if s and s.strip())
 
 
@@ -356,12 +358,34 @@ def _decode_call(
     return _parse_tool_call(json.dumps(normalized_obj), index)
 
 
+def _strip_assistant_prefixes(text: str) -> str:
+    """Remove leaked line-start ``Assistant:`` role prefixes outside fenced code blocks."""
+    if not text or "Assistant:" not in text:
+        return text
+    out: list[str] = []
+    in_fence = False
+    for line in text.splitlines(keepends=True):
+        if _FENCE_LINE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        if not in_fence:
+            stripped = _ASSISTANT_LINE_PREFIX_RE.sub("", line, count=1)
+            if stripped != line:
+                if stripped:
+                    out.append(stripped)
+                continue
+        out.append(line)
+    return "".join(out)
+
+
 def _strip_prompt_echoes(text: str) -> str:
-    """Remove synthetic harness wrapper headers and `Tool result:` blocks echoed by the model."""
+    """Remove synthetic harness wrapper headers, `Tool result:` blocks, and leaked `Assistant:` prefixes."""
     if not text:
         return text
     text = _HARNESS_WRAPPER_ECHO_RE.sub("", text, count=1)
     if "Tool result" not in text:
+        text = _strip_assistant_prefixes(text)
         return text.strip() if text != text.lstrip() else text
     decoder = json.JSONDecoder()
     pieces: list[str] = []
@@ -385,10 +409,10 @@ def _strip_prompt_echoes(text: str) -> str:
             pieces.append(text[cursor:m.start()])
         cursor = end
     if cursor == 0:
-        return text
+        return _strip_assistant_prefixes(text)
     if cursor < len(text):
         pieces.append(text[cursor:])
-    return "".join(pieces).strip()
+    return _strip_assistant_prefixes("".join(pieces)).strip()
 
 
 def _extract_tool_calls_with_errors(
@@ -800,11 +824,63 @@ class _CursorACPStream:
         self._done = False
         self._raw_text = ""
         self._emitted_len = 0
+        self._emitted_text = ""
+        self._at_line_start = True
+        self._in_fence = False
         self._started_text = False
         self._echo_cleared = False
         self._run_fn = run_fn
         self._worker = threading.Thread(target=self._run_worker, daemon=True)
         self._worker.start()
+
+    def _drain_stream_pieces(self) -> str:
+        """Consume safe prefix from ``self._raw_text[self._emitted_len:]``, stripping leaked ``Assistant:`` lines."""
+        out: list[str] = []
+        while self._emitted_len < len(self._raw_text):
+            tail = self._raw_text[self._emitted_len:]
+            if self._at_line_start and not self._in_fence:
+                no_indent = tail.lstrip(" \t")
+                if not no_indent:
+                    break
+                if "Assistant:".startswith(no_indent) or no_indent == "Assistant:":
+                    break
+                m = _ASSISTANT_LINE_PREFIX_RE.match(tail)
+                if m:
+                    # If the match ended at 'Assistant:' or 'Assistant:   ' without a newline/body, wait for next char.
+                    if m.end() == len(tail) and not tail.endswith("\n"):
+                        break
+                    self._emitted_len += m.end()
+                    self._at_line_start = m.group(0).endswith("\n")
+                    continue
+            if self._tool_names:
+                safe_end = _safe_prefix_end(self._raw_text, self._emitted_len)
+            else:
+                nl = tail.find("\n")
+                if nl != -1:
+                    safe_end = self._emitted_len + nl + 1
+                elif tail.endswith(("\n", "`")):
+                    safe_end = self._emitted_len + max(0, len(tail) - 1)
+                else:
+                    safe_end = len(self._raw_text)
+            if safe_end <= self._emitted_len:
+                break
+            # Stop at the first newline so we re-check _at_line_start / _in_fence on the next line.
+            chunk = self._raw_text[self._emitted_len:safe_end]
+            nl = chunk.find("\n")
+            if nl != -1:
+                chunk = chunk[:nl + 1]
+            if self._at_line_start and _FENCE_LINE_RE.match(chunk):
+                if chunk.endswith("\n"):
+                    self._in_fence = not self._in_fence
+                else:
+                    break
+            self._emitted_len += len(chunk)
+            self._at_line_start = chunk.endswith("\n")
+            out.append(chunk)
+        piece = "".join(out)
+        if piece:
+            self._emitted_text += piece
+        return piece
 
     def _run_worker(self) -> None:
         def _on_chunk(kind: str, text: str) -> None:
@@ -886,16 +962,8 @@ class _CursorACPStream:
                     if definite or possible:
                         continue
                     self._echo_cleared = True
-                if not self._tool_names:
-                    piece = self._raw_text[self._emitted_len:]
-                    self._emitted_len = len(self._raw_text)
-                    if piece:
-                        return self._make_chunk(content=piece)
-                    continue
-                safe_end = _safe_prefix_end(self._raw_text, self._emitted_len)
-                if safe_end > self._emitted_len:
-                    piece = self._raw_text[self._emitted_len:safe_end]
-                    self._emitted_len = safe_end
+                piece = self._drain_stream_pieces()
+                if piece:
                     return self._make_chunk(content=piece)
                 continue
             if kind == "error":
@@ -913,7 +981,7 @@ class _CursorACPStream:
                     )
                 if not tool_calls and not cleaned and _strip_prompt_echoes(full_text) != full_text:
                     raise ConnectionError("Cursor ACP echoed its prompt tool results instead of returning an assistant response.")
-                already = self._raw_text[:self._emitted_len] if self._started_text else ""
+                already = self._emitted_text
                 if already and cleaned.startswith(already):
                     rem = cleaned[len(already):]
                 elif already:
