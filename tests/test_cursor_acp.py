@@ -379,10 +379,10 @@ def test_prompt_keeps_prior_tool_calls_and_ends_with_tool_reminder(plugin):
     prompt = plugin._format_prompt(messages, tools, None)
     assert ('<tool_call>{"id": "c1", "type": "function", "function": {"name": "terminal", '
             '"arguments": "{\\"command\\": \\"date +%Y\\"}"}}</tool_call>') in prompt
-    transcript = prompt.split("Conversation so far:")[1].split("Now continue as the Assistant")[0]
+    transcript = prompt.split("Conversation so far:")[1].split("Respond to the latest turn.")[0]
     calls, _ = plugin.extract_tool_calls(transcript)
     assert [c.function.name for c in calls] == ["terminal"]
-    assert "Tool result (terminal):\n2026" in prompt
+    assert '<turn role="tool" name="terminal">\n2026\n</turn>' in prompt
     assert prompt.rstrip().endswith("they are refused.")
     assert "ACP capabilities" not in prompt
 
