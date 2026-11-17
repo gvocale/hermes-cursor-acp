@@ -547,6 +547,66 @@ class CursorACPErrorAndEchoTests(unittest.TestCase):
         content = "".join(c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content)
         self.assertEqual(content, "Yes\nI checked it.")
 
+    def test_prompts_use_turn_tags_without_assistant_role_labels(self):
+        messages = [
+            {"role": "user", "content": "first question"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "terminal", "content": "ok"},
+        ]
+        prompt = self.mod._format_prompt(messages, None, None)
+        self.assertNotIn("Assistant:", prompt)
+        self.assertNotIn("Now continue as the Assistant", prompt)
+        self.assertIn('<turn role="user">', prompt)
+        self.assertIn('<turn role="tool" name="terminal">', prompt)
+        delta = self.mod._format_delta_prompt(messages[1:], ["terminal"])
+        self.assertNotIn("Assistant:", delta)
+        self.assertNotIn("Now continue as the Assistant", delta)
+        self.assertIn('<turn role="assistant">', delta)
+        self.assertIn('<turn role="tool" name="terminal">', delta)
+        self.assertIn("Continue the response.", delta)
+
+    def test_extract_tool_calls_strips_assistant_prefixes_outside_fences(self):
+        text = (
+            "Assistant:\nChecking now.\n\n"
+            "Assistant: Let's run it.\n"
+            "```text\nAssistant: keep inside fence\n```\n"
+            '<tool_call>{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}</tool_call>'
+        )
+        calls, cleaned = self.mod.extract_tool_calls(text, tool_names=["terminal"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            cleaned,
+            "Checking now.\n\nLet's run it.\n```text\nAssistant: keep inside fence\n```",
+        )
+
+    def test_stream_strips_leading_and_mid_reply_assistant_prefixes(self):
+        def run_fn(on_chunk):
+            chunks = [
+                "Ass",
+                "istant:\nChecking now.\n\n",
+                "Assistant: ",
+                "Next step.\n",
+                "```\nAssistant: inside fence\n```\nDone.",
+            ]
+            for ch in chunks:
+                on_chunk("text", ch)
+            return "".join(chunks), ""
+
+        for tool_names in ([], ["terminal"]):
+            stream = self.mod._CursorACPStream(
+                client=object(),
+                model="gemini-4-hydrogen",
+                tool_names=tool_names,
+                run_fn=run_fn,
+            )
+            out = list(stream)
+            text = "".join(c.choices[0].delta.content or "" for c in out if c.choices)
+            self.assertEqual(
+                text,
+                "Checking now.\n\nNext step.\n```\nAssistant: inside fence\n```\nDone.",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

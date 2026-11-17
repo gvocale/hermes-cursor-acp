@@ -250,7 +250,8 @@ def _render_message(msg: dict[str, Any]) -> str:
             ensure_ascii=False) + "</tool_call>")
     attrs = f'role="{role}"'
     if role == "tool" and msg.get("name"):
-        attrs += f' name="{msg[\"name\"]}"'
+        tool_name = msg["name"]
+        attrs += f' name="{tool_name}"'
     body = "\n".join(p for p in parts if p)
     return f"<turn {attrs}>\n{body}\n</turn>" if body else ""
 
