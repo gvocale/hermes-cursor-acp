@@ -992,3 +992,131 @@ class TransientErrorKeepsSessionTests(unittest.TestCase):
         self.replies.append(self.TOOL_REPLY)
         self.run_turn(self.MSGS2)  # the pool prunes the dead one; a fresh session answers
         self.assertEqual(self.opened, 2)
+
+
+class PoolCapacityTests(unittest.TestCase):
+    """The pool must hold the chats that are active at once, and say so when it evicts one."""
+
+    ENV = "HERMES_CURSOR_ACP_POOL_MAX"
+
+    def setUp(self):
+        import os
+        self.mod = _load_plugin()
+        self._saved = os.environ.pop(self.ENV, None)
+
+    def tearDown(self):
+        import os
+        os.environ.pop(self.ENV, None)
+        if self._saved is not None:
+            os.environ[self.ENV] = self._saved
+
+    def _capacity(self, value):
+        import os
+        if value is None:
+            os.environ.pop(self.ENV, None)
+        else:
+            os.environ[self.ENV] = value
+        return self.mod._pool_capacity()
+
+    def test_default_override_and_bad_values(self):
+        self.assertEqual(self._capacity(None), 24)
+        self.assertEqual(self._capacity("40"), 40)
+        self.assertEqual(self._capacity(" 3 "), 3)
+        for bad in ("0", "-2", "many", "1.5"):
+            self.assertEqual(self._capacity(bad), 24, bad)
+
+    def test_pool_uses_the_configured_capacity(self):
+        self.assertEqual(self.mod._ACPSessionPool()._max_sessions, 24)
+        self.assertEqual(self.mod._ACPSessionPool(max_sessions=5)._max_sessions, 5)
+
+    # --- chats taking turns against a pool, with fake sessions -------------------------------------------------
+    class _Proc:
+        def __init__(self):
+            self.alive = True
+        def poll(self):
+            return None if self.alive else 1
+        def terminate(self):
+            self.alive = False
+        def wait(self, timeout=None):
+            pass
+        def kill(self):
+            self.alive = False
+
+    def _session(self, chat, sent):
+        import queue
+        from collections import deque
+        return self.mod._WarmACPSession(
+            proc=self._Proc(), inbox=queue.Queue(), stderr_tail=deque(), stderr_pump=None,
+            request_ids=iter(range(1, 9)), session_id=f"s-{chat}", config_key=("cfg",), sent_rendered=sent)
+
+    @staticmethod
+    def _turn_messages(chat, sent_count=2):
+        """A chat's next request: what the session was sent, then the assistant reply and a new tool result."""
+        sent = [f"<turn role=\"system\">sys</turn>", f"<turn role=\"user\">chat {chat}</turn>"]
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": f"chat {chat}"},
+                {"role": "assistant", "content": "ok"}, {"role": "tool", "content": "result"}]
+        rendered = sent + ["<turn role=\"assistant\">ok</turn>", "<turn role=\"tool\">result</turn>"]
+        return sent, rendered, msgs
+
+    def _round_robin(self, pool, chats, rounds):
+        cold = 0
+        for _ in range(rounds):
+            for chat in range(chats):
+                sent, rendered, msgs = self._turn_messages(chat)
+                got = pool.checkout(("cfg",), rendered, msgs)
+                if got is None:
+                    cold += 1
+                    got = self._session(chat, sent)
+                pool.checkin(got)
+        return cold
+
+    def test_enough_capacity_serves_every_chat_after_its_first_call(self):
+        pool = self.mod._ACPSessionPool(max_sessions=12)
+        self.assertEqual(self._round_robin(pool, chats=12, rounds=5), 12)  # only each chat's first call
+        pool.close_all()
+
+    def test_too_little_capacity_makes_every_call_cold(self):
+        pool = self.mod._ACPSessionPool(max_sessions=8)
+        self.assertEqual(self._round_robin(pool, chats=12, rounds=3), 36)  # oldest-idle eviction thrashes
+        pool.close_all()
+
+    def test_miss_says_this_conversations_session_was_evicted_at_capacity(self):
+        pool = self.mod._ACPSessionPool(max_sessions=2)
+        self._round_robin(pool, chats=3, rounds=1)  # chat 0's session is pushed out by chat 2
+        sent, rendered, msgs = self._turn_messages(0)
+        with self.assertLogs(level="INFO") as logs:
+            self.assertIsNone(pool.checkout(("cfg",), rendered, msgs))
+        text = "\n".join(logs.output)
+        self.assertIn("evicted (pool full at 2)", text)
+        self.assertIn("pool=2/2", text)
+        pool.close_all()
+
+    def test_miss_says_idle_timeout_and_dead_process(self):
+        pool = self.mod._ACPSessionPool(max_sessions=4, idle_ttl_seconds=0.0)
+        sent, rendered, msgs = self._turn_messages(0)
+        pool.checkin(self._session(0, sent))
+        import time
+        time.sleep(0.01)
+        with self.assertLogs(level="INFO") as logs:
+            self.assertIsNone(pool.checkout(("cfg",), rendered, msgs))
+        self.assertIn("evicted (idle more than 0s)", "\n".join(logs.output))
+        pool.close_all()
+
+        pool = self.mod._ACPSessionPool(max_sessions=4)
+        sess = self._session(1, sent)
+        pool.checkin(sess)
+        sess.proc.alive = False
+        with self.assertLogs(level="INFO") as logs:
+            self.assertIsNone(pool.checkout(("cfg",), rendered, msgs))
+        self.assertIn("evicted (its process had exited)", "\n".join(logs.output))
+
+    def test_a_chat_that_never_had_a_session_is_not_called_evicted(self):
+        pool = self.mod._ACPSessionPool(max_sessions=2)
+        self._round_robin(pool, chats=3, rounds=1)
+        sent, rendered, msgs = self._turn_messages(99)  # a conversation the pool has never seen
+        with self.assertLogs(level="INFO") as logs:
+            self.assertIsNone(pool.checkout(("cfg",), rendered, msgs))
+        text = "\n".join(logs.output)
+        self.assertNotIn("evicted", text)
+        self.assertIn("closest idle session", text)
+        pool.close_all()

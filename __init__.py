@@ -724,21 +724,81 @@ def _terminate_proc(proc: subprocess.Popen[str]) -> None:
             proc.kill()
 
 
-class _ACPSessionPool:
-    """Module-level pool of idle warm ``agent acp`` sessions keyed by config + message prefix."""
+_DEFAULT_POOL_MAX = 24
+_POOL_MAX_ENV = "HERMES_CURSOR_ACP_POOL_MAX"
 
-    def __init__(self, max_sessions: int = 8, idle_ttl_seconds: float = 600.0):
-        self._max_sessions = max_sessions
+
+def _pool_capacity() -> int:
+    """How many idle warm sessions the pool keeps, from ``HERMES_CURSOR_ACP_POOL_MAX`` (default 24).
+
+    One warm session is one ``agent acp`` process, about 250 MB resident. A chat only gets its session back
+    if it is still in the pool, so the capacity has to cover the chats active within the idle window: with 19
+    chats active in 10 minutes, a pool of 8 sent 38% of calls cold (the whole conversation replayed as
+    uncached input) against 14% at 24.
+    """
+    raw = os.environ.get(_POOL_MAX_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_POOL_MAX
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.warning("cursor-acp: ignoring %s=%r (need a whole number of at least 1); using %d",
+                       _POOL_MAX_ENV, raw, _DEFAULT_POOL_MAX)
+        return _DEFAULT_POOL_MAX
+    return value
+
+
+def _prefix_digest(rendered: list[str]) -> str:
+    return hashlib.sha1("\x00".join(rendered).encode("utf-8", errors="replace")).hexdigest()
+
+
+class _Eviction:
+    """What the pool remembers about a session it let go, so a later miss can say it was evicted."""
+
+    __slots__ = ("config_key", "sent_count", "digest", "reason", "at")
+
+    def __init__(self, sess: _WarmACPSession, reason: str, at: float):
+        self.config_key = sess.config_key
+        self.sent_count = len(sess.sent_rendered)
+        self.digest = _prefix_digest(sess.sent_rendered)
+        self.reason = reason
+        self.at = at
+
+
+class _ACPSessionPool:
+    """Module-level pool of idle warm ``agent acp`` sessions keyed by config + message prefix.
+
+    A session leaves the pool for exactly one of four reasons, recorded in one place (``_let_go_locked``):
+    checked out for a turn, idle too long, its process exited, or the pool was full (oldest idle goes first).
+    The last few evictions are remembered by digest, so a miss can tell "this chat's session was evicted" from
+    "this chat never had one".
+    """
+
+    _EVICTION_MEMORY = 32
+    _EVICTIONS_CHECKED_PER_MISS = 8
+
+    def __init__(self, max_sessions: int | None = None, idle_ttl_seconds: float = 600.0):
+        self._max_sessions = _pool_capacity() if max_sessions is None else max_sessions
         self._idle_ttl = idle_ttl_seconds
         self._lock = threading.Lock()
         self._sessions: list[_WarmACPSession] = []
+        self._evictions: deque[_Eviction] = deque(maxlen=self._EVICTION_MEMORY)
+
+    def _let_go_locked(self, sess: _WarmACPSession, reason: str, now: float) -> _WarmACPSession:
+        if sess.sent_rendered:
+            self._evictions.append(_Eviction(sess, reason, now))
+        return sess
 
     def _prune_locked(self, now: float) -> list[_WarmACPSession]:
         keep: list[_WarmACPSession] = []
         evict: list[_WarmACPSession] = []
         for s in self._sessions:
-            if s.proc.poll() is not None or (now - s.last_used_at) > self._idle_ttl:
-                evict.append(s)
+            if s.proc.poll() is not None:
+                evict.append(self._let_go_locked(s, "its process had exited", now))
+            elif (now - s.last_used_at) > self._idle_ttl:
+                evict.append(self._let_go_locked(s, f"idle more than {self._idle_ttl:.0f}s", now))
             else:
                 keep.append(s)
         self._sessions = keep
@@ -762,25 +822,26 @@ class _ACPSessionPool:
                         match_idx = idx
             picked = self._sessions.pop(match_idx) if match_idx is not None else None
             if picked is None:
-                self._log_miss_locked(config_key, rendered, messages)
+                logger.info("cursor-acp warm-session miss: %s", self.explain_miss_locked(config_key, rendered, messages, now))
         for s in evict:
             _terminate_proc(s.proc)
         return picked
 
-    def _log_miss_locked(self, config_key: tuple[Any, ...], rendered: list[str],
-                         messages: list[dict[str, Any]]) -> None:
-        """A miss re-sends the whole conversation to Cursor as uncached input (billed at the full
-        input rate). Say why, so cost spikes can be traced from the log."""
+    def explain_miss_locked(self, config_key: tuple[Any, ...], rendered: list[str],
+                            messages: list[dict[str, Any]], now: float) -> str:
+        """Why no pooled session served this request. A miss re-sends the whole conversation to Cursor as
+        uncached input (billed at the full input rate), so the reason is logged to trace cost spikes."""
+        head = f"msgs={len(messages)} pool={len(self._sessions)}/{self._max_sessions}"
+        for ev in list(self._evictions)[-self._EVICTIONS_CHECKED_PER_MISS:][::-1]:
+            if ev.config_key == config_key and ev.sent_count < len(rendered) \
+                    and _prefix_digest(rendered[:ev.sent_count]) == ev.digest:
+                return f"{head} this conversation's session was evicted ({ev.reason}) {now - ev.at:.0f}s ago"
         same = [s for s in self._sessions if s.config_key == config_key]
         if not same:
-            logger.info("cursor-acp warm-session miss: no idle session (pool=%d, msgs=%d)", len(self._sessions), len(messages))
-            return
+            return f"{head} no idle session with this configuration"
         best = max(same, key=lambda s: sum(1 for a, b in zip(rendered, s.sent_rendered) if a == b))
-        n = len(best.sent_rendered)
         diverge = next((i for i, (a, b) in enumerate(zip(rendered, best.sent_rendered)) if a != b), None)
-        logger.info("cursor-acp warm-session miss: msgs=%d sent=%d first_diff_index=%s next_role=%s",
-                    len(messages), n, diverge,
-                    str((messages[n] or {}).get("role")) if len(messages) > n else "n/a")
+        return f"{head} closest idle session sent={len(best.sent_rendered)} first_diff_index={diverge}"
 
     def checkin(self, sess: _WarmACPSession) -> None:
         if sess.proc.poll() is not None:
@@ -793,7 +854,8 @@ class _ACPSessionPool:
             evict.extend(self._prune_locked(now))
             while len(self._sessions) >= self._max_sessions:
                 oldest_idx = min(range(len(self._sessions)), key=lambda i: self._sessions[i].last_used_at)
-                evict.append(self._sessions.pop(oldest_idx))
+                evict.append(self._let_go_locked(
+                    self._sessions.pop(oldest_idx), f"pool full at {self._max_sessions}", now))
             self._sessions.append(sess)
         for s in evict:
             _terminate_proc(s.proc)
