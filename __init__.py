@@ -394,11 +394,20 @@ def _strip_prompt_echoes(text: str) -> str:
     for m in _PROMPT_TOOL_ECHO_RE.finditer(text):
         if m.start() < cursor:
             continue
+        pos = m.end()
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos < len(text) and text[pos] == "{":
+            try:
+                _, end = decoder.raw_decode(text, pos)
+            except ValueError:
+                nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, pos)
+                end = nxt.start() if nxt else len(text)
+        else:
+            nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, m.end())
+            end = nxt.start() if nxt else len(text)
         if m.start() > cursor:
             pieces.append(text[cursor:m.start()])
-        end = _consume_echoed_tool_result(text, m.end(), decoder)
-        if end is None:
-            return text
         cursor = end
     if cursor == 0:
         return _strip_assistant_prefixes(text)
