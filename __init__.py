@@ -597,6 +597,34 @@ def _set_model_with_retry(request: Any, session_id: str, model_id: str, attempts
             time.sleep(0.5 * attempt)
 
 
+def _fast_requested() -> str:
+    """Cursor 'fast' mode is billed at 2x or more, so it is only on when explicitly asked for."""
+    return "true" if os.environ.get("HERMES_CURSOR_ACP_FAST", "").strip().lower() in {"1", "true", "yes", "on"} else "false"
+
+
+def _apply_model_options(request: Any, session_id: str, model_id: str | None, effort: str | None) -> None:
+    """Pin the billable per-model options right after ``session/set_model``.
+
+    ``agent acp`` seeds a freshly selected model from the Cursor CLI's saved last-picked
+    parameters (``~/.cursor/cli-config.json`` ``modelParameters``), so a bare ``grok-4.7`` can
+    come up as ``fast=true, reasoning_effort=high`` while Hermes shows Medium. Set ``fast`` and
+    ``reasoning_effort`` explicitly on every session. Models without a ``fast`` option reject
+    it, which is fine.
+    """
+    if "[" in (model_id or ""):
+        return
+    for config_id, value in (("fast", _fast_requested()), ("reasoning_effort", effort)):
+        if not value:
+            continue
+        try:
+            request("session/set_config_option", {"sessionId": session_id, "configId": config_id, "value": value})
+        except Exception as exc:
+            if config_id == "reasoning_effort":
+                logger.warning("Cursor ACP reasoning_effort=%s not applied for %s: %s", value, model_id, exc)
+            else:
+                logger.debug("Cursor ACP %s=%s not applied for %s: %s", config_id, value, model_id, exc)
+
+
 _EFFORT_ALIASES = {"minimal": "low", "low": "low", "medium": "medium", "high": "high",
                    "xhigh": "xhigh", "max": "xhigh"}
 
@@ -732,9 +760,26 @@ class _ACPSessionPool:
                         best_len = n
                         match_idx = idx
             picked = self._sessions.pop(match_idx) if match_idx is not None else None
+            if picked is None:
+                self._log_miss_locked(config_key, rendered, messages)
         for s in evict:
             _terminate_proc(s.proc)
         return picked
+
+    def _log_miss_locked(self, config_key: tuple[Any, ...], rendered: list[str],
+                         messages: list[dict[str, Any]]) -> None:
+        """A miss re-sends the whole conversation to Cursor as uncached input (billed at the full
+        input rate). Say why, so cost spikes can be traced from the log."""
+        same = [s for s in self._sessions if s.config_key == config_key]
+        if not same:
+            logger.info("cursor-acp warm-session miss: no idle session (pool=%d, msgs=%d)", len(self._sessions), len(messages))
+            return
+        best = max(same, key=lambda s: sum(1 for a, b in zip(rendered, s.sent_rendered) if a == b))
+        n = len(best.sent_rendered)
+        diverge = next((i for i, (a, b) in enumerate(zip(rendered, best.sent_rendered)) if a != b), None)
+        logger.info("cursor-acp warm-session miss: msgs=%d sent=%d first_diff_index=%s next_role=%s",
+                    len(messages), n, diverge,
+                    str((messages[n] or {}).get("role")) if len(messages) > n else "n/a")
 
     def checkin(self, sess: _WarmACPSession) -> None:
         if sess.proc.poll() is not None:
@@ -1355,15 +1400,10 @@ def _make_client_class():
                         lambda m, p: self._session_request(sess, m, p, deadline=deadline),
                         session_id, model_id,
                     )
-                if effort and "[" not in (model_id or ""):
-                    try:
-                        self._session_request(
-                            sess, "session/set_config_option",
-                            {"sessionId": session_id, "configId": "reasoning_effort", "value": effort},
-                            deadline=deadline,
-                        )
-                    except Exception as exc:
-                        logger.warning("Cursor ACP reasoning_effort=%s not applied for %s: %s", effort, model_id, exc)
+                _apply_model_options(
+                    lambda m, p: self._session_request(sess, m, p, deadline=deadline),
+                    session_id, model_id, effort,
+                )
                 if mode:
                     try:
                         self._session_request(sess, "session/set_mode", {"sessionId": session_id, "modeId": mode}, deadline=deadline)
@@ -1454,11 +1494,7 @@ def _make_client_class():
                                 "Check /model in Hermes or run `cursor-agent models` to inspect Cursor availability.")
                         if model_id:
                             _set_model_with_retry(_request, session_id, model_id)
-                        if effort and "[" not in (model_id or ""):
-                            try:
-                                _request("session/set_config_option", {"sessionId": session_id, "configId": "reasoning_effort", "value": effort})
-                            except Exception as exc:
-                                logger.warning("Cursor ACP reasoning_effort=%s not applied for %s: %s", effort, model_id, exc)
+                        _apply_model_options(_request, session_id, model_id, effort)
                         if mode:
                             try:
                                 _request("session/set_mode", {"sessionId": session_id, "modeId": mode})

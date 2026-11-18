@@ -812,3 +812,41 @@ class CursorACPErrorAndEchoTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ApplyModelOptionsTests(unittest.TestCase):
+    def _calls(self, model_id, effort, fast_env=None, reject=()):
+        import os
+        mod = _load_plugin()
+        calls = []
+
+        def request(method, params):
+            if params["configId"] in reject:
+                raise RuntimeError("Invalid params")
+            calls.append((params["configId"], params["value"]))
+
+        old = os.environ.pop("HERMES_CURSOR_ACP_FAST", None)
+        if fast_env is not None:
+            os.environ["HERMES_CURSOR_ACP_FAST"] = fast_env
+        try:
+            mod._apply_model_options(request, "sid", model_id, effort)
+        finally:
+            os.environ.pop("HERMES_CURSOR_ACP_FAST", None)
+            if old is not None:
+                os.environ["HERMES_CURSOR_ACP_FAST"] = old
+        return calls
+
+    def test_pins_fast_false_and_effort(self):
+        self.assertEqual(self._calls("grok-4.7", "medium"), [("fast", "false"), ("reasoning_effort", "medium")])
+
+    def test_fast_false_even_without_effort(self):
+        self.assertEqual(self._calls("grok-4.7", None), [("fast", "false")])
+
+    def test_fast_opt_in_env(self):
+        self.assertEqual(self._calls("grok-4.7", "low", fast_env="1"), [("fast", "true"), ("reasoning_effort", "low")])
+
+    def test_model_without_fast_option_still_sets_effort(self):
+        self.assertEqual(self._calls("gemini-4-hydrogen", "medium", reject=("fast",)), [("reasoning_effort", "medium")])
+
+    def test_variant_id_is_left_alone(self):
+        self.assertEqual(self._calls("claude-opus-5-5[effort=high,fast=false]", "medium"), [])
