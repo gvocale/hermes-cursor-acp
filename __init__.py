@@ -381,10 +381,15 @@ def _strip_assistant_prefixes(text: str) -> str:
 
 
 def _strip_prompt_echoes(text: str) -> str:
+<<<<<<< HEAD
     """Remove synthetic harness wrapper headers, `Tool result:` blocks, and leaked `Assistant:` prefixes."""
+=======
+    """Remove synthetic harness wrapper headers, leading `Assistant:` labels, and `Tool result:` blocks."""
+>>>>>>> d93b81b (Suppress pre-tool scratchpad streaming and strip Assistant: echoes)
     if not text:
         return text
     text = _HARNESS_WRAPPER_ECHO_RE.sub("", text, count=1)
+    text = _ASSISTANT_PREFIX_RE.sub("", text.lstrip(), count=1) if text.lstrip().startswith("Assistant:") else text
     if "Tool result" not in text:
         text = _strip_assistant_prefixes(text)
         return text.strip() if text != text.lstrip() else text
@@ -413,7 +418,14 @@ def _strip_prompt_echoes(text: str) -> str:
         return _strip_assistant_prefixes(text)
     if cursor < len(text):
         pieces.append(text[cursor:])
+<<<<<<< HEAD
     return _strip_assistant_prefixes("".join(pieces)).strip()
+=======
+    out = "".join(pieces).strip()
+    if out.startswith("Assistant:"):
+        out = _ASSISTANT_PREFIX_RE.sub("", out, count=1).strip()
+    return out
+>>>>>>> d93b81b (Suppress pre-tool scratchpad streaming and strip Assistant: echoes)
 
 
 def _extract_tool_calls_with_errors(
@@ -736,6 +748,7 @@ _STREAM_ECHO_PREFIXES = (
     "Tool result (",
 )
 _ECHO_PREFIXES = (
+    "Assistant:",
     "user\n<timestamp>",
     "user\r\n<timestamp>",
     "user\n<user_query>",
@@ -963,9 +976,20 @@ class _CursorACPStream:
                     if definite or possible:
                         continue
                     self._echo_cleared = True
+<<<<<<< HEAD
                 piece = self._drain_stream_pieces()
                 if piece:
                     return self._make_chunk(content=piece)
+=======
+                if not self._tool_names:
+                    piece = self._raw_text[self._emitted_len:]
+                    self._emitted_len = len(self._raw_text)
+                    if piece:
+                        return self._make_chunk(content=piece)
+                    continue
+                # Tools are offered: hold text until done so pre-tool scratchpad
+                # never leaks into user-facing assistant.delta before <tool_call>.
+>>>>>>> d93b81b (Suppress pre-tool scratchpad streaming and strip Assistant: echoes)
                 continue
             if kind == "error":
                 self._done = True
@@ -1005,11 +1029,19 @@ class _CursorACPStream:
                         for idx, tc in enumerate(tool_calls)
                     ]
                 finish_reason = "tool_calls" if tool_calls else "stop"
-                self._pending_chunks.append(self._make_chunk(
-                    content=rem or None,
-                    tool_calls=tc_deltas,
-                    finish_reason=finish_reason,
-                ))
+                if tool_calls:
+                    self._pending_chunks.append(self._make_chunk(
+                        content=None,
+                        reasoning=rem or None,
+                        tool_calls=tc_deltas,
+                        finish_reason=finish_reason,
+                    ))
+                else:
+                    self._pending_chunks.append(self._make_chunk(
+                        content=rem or None,
+                        tool_calls=None,
+                        finish_reason=finish_reason,
+                    ))
                 self._pending_chunks.append(self._make_chunk(choices_present=False))
                 return self._pending_chunks.popleft()
 
@@ -1134,6 +1166,9 @@ def _make_client_class():
                 prompt_images=_extract_images_from_messages(msgs),
             )
             tool_calls, cleaned = extract_tool_calls(response_text, names)
+            if tool_calls and cleaned:
+                reasoning = f"{reasoning}\n\n{cleaned}".strip() if reasoning else cleaned
+                cleaned = ""
             message = SimpleNamespace(content=cleaned, tool_calls=tool_calls, reasoning=reasoning or None,
                                       reasoning_content=reasoning or None, reasoning_details=None)
             return SimpleNamespace(

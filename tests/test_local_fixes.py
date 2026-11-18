@@ -106,10 +106,28 @@ class CursorACPErrorAndEchoTests(unittest.TestCase):
         )
         chunks = list(stream)
         content = "".join(c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content)
+        reasoning = "".join(c.choices[0].delta.reasoning for c in chunks if c.choices and c.choices[0].delta.reasoning)
         tool_calls = [tc for c in chunks if c.choices for tc in (c.choices[0].delta.tool_calls or [])]
-        self.assertEqual(content, "Let me check.")
+        self.assertEqual(content, "")
+        self.assertEqual(reasoning, "Let me check.")
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(tool_calls[0].function.name, "terminal")
+
+    def test_stream_strips_leading_assistant_label_and_emits_final_answer(self):
+        def run_fn(on_chunk):
+            on_chunk("text", "Assistant:\n")
+            on_chunk("text", "All checks are green.")
+            return "Assistant:\nAll checks are green.", ""
+
+        stream = self.mod._CursorACPStream(
+            client=object(),
+            model="gemini-4-hydrogen",
+            tool_names=["terminal"],
+            run_fn=run_fn,
+        )
+        chunks = list(stream)
+        content = "".join(c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content)
+        self.assertEqual(content, "All checks are green.")
 
     def test_stream_allows_literal_user_reply(self):
         def run_fn(on_chunk):
