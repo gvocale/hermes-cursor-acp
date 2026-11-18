@@ -381,15 +381,10 @@ def _strip_assistant_prefixes(text: str) -> str:
 
 
 def _strip_prompt_echoes(text: str) -> str:
-<<<<<<< HEAD
     """Remove synthetic harness wrapper headers, `Tool result:` blocks, and leaked `Assistant:` prefixes."""
-=======
-    """Remove synthetic harness wrapper headers, leading `Assistant:` labels, and `Tool result:` blocks."""
->>>>>>> d93b81b (Suppress pre-tool scratchpad streaming and strip Assistant: echoes)
     if not text:
         return text
     text = _HARNESS_WRAPPER_ECHO_RE.sub("", text, count=1)
-    text = _ASSISTANT_PREFIX_RE.sub("", text.lstrip(), count=1) if text.lstrip().startswith("Assistant:") else text
     if "Tool result" not in text:
         text = _strip_assistant_prefixes(text)
         return text.strip() if text != text.lstrip() else text
@@ -399,33 +394,17 @@ def _strip_prompt_echoes(text: str) -> str:
     for m in _PROMPT_TOOL_ECHO_RE.finditer(text):
         if m.start() < cursor:
             continue
-        pos = m.end()
-        while pos < len(text) and text[pos].isspace():
-            pos += 1
-        if pos < len(text) and text[pos] == "{":
-            try:
-                _, end = decoder.raw_decode(text, pos)
-            except ValueError:
-                nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, pos)
-                end = nxt.start() if nxt else len(text)
-        else:
-            nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, m.end())
-            end = nxt.start() if nxt else len(text)
         if m.start() > cursor:
             pieces.append(text[cursor:m.start()])
+        end = _consume_echoed_tool_result(text, m.end(), decoder)
+        if end is None:
+            return text
         cursor = end
     if cursor == 0:
         return _strip_assistant_prefixes(text)
     if cursor < len(text):
         pieces.append(text[cursor:])
-<<<<<<< HEAD
     return _strip_assistant_prefixes("".join(pieces)).strip()
-=======
-    out = "".join(pieces).strip()
-    if out.startswith("Assistant:"):
-        out = _ASSISTANT_PREFIX_RE.sub("", out, count=1).strip()
-    return out
->>>>>>> d93b81b (Suppress pre-tool scratchpad streaming and strip Assistant: echoes)
 
 
 def _extract_tool_calls_with_errors(
