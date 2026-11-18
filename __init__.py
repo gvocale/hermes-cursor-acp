@@ -42,8 +42,8 @@ from providers.base import ProviderProfile
 logger = logging.getLogger(__name__)
 
 CURSOR_MARKER_BASE_URL = "acp://cursor"
-_TOOL_CALL_TAG_NAME = r"(?:tool_?call(?::\d+)?|call(?::\d+)?|function_call(?::\d+)?)"
-_TOOL_CALL_OPEN_PATTERN = rf"<(?:{_TOOL_CALL_TAG_NAME})>"
+_TOOL_CALL_TAG_NAME = r"(?:tool_?call|call|function_call)(?::[A-Za-z0-9_.:-]+)?"
+_TOOL_CALL_OPEN_PATTERN = rf"<(?:{_TOOL_CALL_TAG_NAME})(?:\s*/)?>"
 _TOOL_CALL_CLOSE_PATTERN = rf"</(?:{_TOOL_CALL_TAG_NAME})>"
 _TOOL_CALL_RE = re.compile(_TOOL_CALL_OPEN_PATTERN, re.IGNORECASE)
 _TOOL_CALL_CLOSE_RE = re.compile(rf"\s*{_TOOL_CALL_CLOSE_PATTERN}", re.IGNORECASE)
@@ -322,26 +322,45 @@ def _validate_and_normalize_arguments(raw_args: Any) -> tuple[str | None, str | 
             return None, f"{err.msg} (char {err.pos})"
 
 
+def _tag_tool_hint(open_tag: str) -> str | None:
+    """Extract a candidate tool name from a named tag like ``<call:default_api:terminal>``."""
+    inner = open_tag.strip()[1:-1].rstrip("/").strip()
+    parts = [p.strip() for p in inner.split(":") if p.strip()]
+    if len(parts) < 2:
+        return None
+    candidate = parts[-1]
+    return None if candidate.isdigit() else candidate
+
+
 def _decode_call(
     obj: Any,
     index: int,
     tool_names: set[str] | None = None,
     *,
+    fallback_name: str | None = None,
     errors: list[str] | None = None,
 ) -> Any:
     """One decoded JSON object -> a Hermes tool call, or None when it is not one.
 
-    Accepts the flat {"name", "arguments"} shape models commonly emit; Hermes' parser only
-    accepts {"function": {...}} and dropped those calls silently. With ``tool_names`` the
-    call must name a tool Hermes offered this turn, and ``arguments`` must be valid JSON.
+    Accepts the OpenAI ``{"function": {...}}`` envelope, the flat ``{"name", "arguments"}``
+    envelope, or—when ``fallback_name`` is supplied by a named tag such as
+    ``<call:default_api:terminal>``—a bare arguments dict. With ``tool_names`` the call must
+    name a tool Hermes offered this turn, and ``arguments`` must be valid JSON.
     """
     from agent.acp_openai_bridge import _parse_tool_call
 
     if not isinstance(obj, dict):
         return None
-    if "function" not in obj and isinstance(obj.get("name"), str):
-        obj = {"id": obj.get("id"), "type": "function",
-               "function": {"name": obj["name"], "arguments": obj.get("arguments", {})}}
+    if "function" not in obj:
+        is_flat_envelope = isinstance(obj.get("name"), str) and (
+            "arguments" in obj or fallback_name is None
+        )
+        if is_flat_envelope:
+            obj = {"id": obj.get("id"), "type": "function",
+                   "function": {"name": obj["name"], "arguments": obj.get("arguments", {})}}
+        elif fallback_name:
+            obj = {"id": None, "type": "function",
+                   "function": {"name": fallback_name, "arguments": obj}}
     fn = obj.get("function")
     if not isinstance(fn, dict):
         return None
@@ -438,6 +457,15 @@ def _extract_tool_calls_with_errors(
     spans: list[tuple[int, int]] = []
     errors: list[str] = []
     for tag in _TOOL_CALL_RE.finditer(text):
+        tag_text = tag.group(0)
+        tag_tool = _tag_tool_hint(tag_text)
+        if tag_text.rstrip().endswith("/>"):
+            if tag_tool is not None:
+                call = _decode_call({}, len(calls) + 1, offered, fallback_name=tag_tool, errors=errors)
+                if call is not None:
+                    calls.append(call)
+                    spans.append((tag.start(), tag.end()))
+            continue
         pos = tag.end()
         while pos < len(text) and text[pos].isspace():
             pos += 1
@@ -447,11 +475,11 @@ def _extract_tool_calls_with_errors(
             obj, end = decoder.raw_decode(text, pos)
         except ValueError as err:
             if tool_names or _TOOL_CALL_CLOSE_SEARCH_RE.search(text, pos):
-                errors.append(f"{tag.group(0)} JSON error: {err}")
+                errors.append(f"{tag_text} JSON error: {err}")
             continue
         close = _TOOL_CALL_CLOSE_RE.match(text, end)
         span_end = close.end() if close else end
-        call = _decode_call(obj, len(calls) + 1, offered, errors=errors)
+        call = _decode_call(obj, len(calls) + 1, offered, fallback_name=tag_tool, errors=errors)
         if call is not None:
             calls.append(call)
             spans.append((tag.start(), span_end))
