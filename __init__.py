@@ -955,20 +955,13 @@ class _CursorACPStream:
                     if definite or possible:
                         continue
                     self._echo_cleared = True
-<<<<<<< HEAD
-                piece = self._drain_stream_pieces()
-                if piece:
-                    return self._make_chunk(content=piece)
-=======
                 if not self._tool_names:
-                    piece = self._raw_text[self._emitted_len:]
-                    self._emitted_len = len(self._raw_text)
+                    piece = self._drain_stream_pieces()
                     if piece:
                         return self._make_chunk(content=piece)
                     continue
                 # Tools are offered: hold text until done so pre-tool scratchpad
                 # never leaks into user-facing assistant.delta before <tool_call>.
->>>>>>> d93b81b (Suppress pre-tool scratchpad streaming and strip Assistant: echoes)
                 continue
             if kind == "error":
                 self._done = True
