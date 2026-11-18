@@ -625,6 +625,113 @@ class CursorACPErrorAndEchoTests(unittest.TestCase):
                 "Checking now.\n\nNext step.\n```\nAssistant: inside fence\n```\nDone.",
             )
 
+    def test_canned_greeting_glitch_detection_and_pool_eviction(self):
+        import queue
+        import tempfile
+        from collections import deque
+
+        self.assertTrue(self.mod._is_canned_greeting_glitch(
+            "Hey! What can I help you with?",
+            "**Planning**\nI will summarize the result.",
+            messages=[{"role": "user", "content": "thanks!"}],
+        ))
+        self.assertTrue(self.mod._is_canned_greeting_glitch(
+            "Hey! What can I help you with?",
+            "",
+            messages=[{"role": "tool", "content": "ok"}],
+        ))
+        self.assertTrue(self.mod._is_canned_greeting_glitch(
+            "Hey! What can I help you with?",
+            "",
+            messages=[{"role": "user", "content": "merge both PR and pull\n[voice-web: page open]"}],
+        ))
+        self.assertFalse(self.mod._is_canned_greeting_glitch(
+            "Hey! What can I help you with?",
+            "",
+            messages=[{"role": "user", "content": "hi"}],
+        ))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cls = self.mod._make_client_class()
+            client = cls(acp_cwd=tmp)
+            terminated = []
+
+            class _FakeProc:
+                def poll(self):
+                    return None
+                def terminate(self):
+                    terminated.append(True)
+                def wait(self, timeout=None):
+                    pass
+                def kill(self):
+                    pass
+
+            def fake_open_warm(**kw):
+                return self.mod._WarmACPSession(
+                    proc=_FakeProc(),
+                    inbox=queue.Queue(),
+                    stderr_tail=deque(maxlen=40),
+                    stderr_pump=None,
+                    request_ids=iter(range(1, 100)),
+                    session_id="s1",
+                    config_key=kw["config_key"],
+                )
+
+            client._open_warm_session = fake_open_warm
+            def fake_session_request(sess, method, params, **kw):
+                if method == "session/prompt":
+                    kw["reasoning_parts"].append("**Thinking**\nDone with the fix.")
+                    kw["text_parts"].append("Hey! What can I help you with?")
+                return {}
+
+            client._session_request = fake_session_request
+            self.mod._ACP_POOL.close_all()
+            try:
+                with self.assertRaises(ConnectionError):
+                    client._run_prompt(
+                        "full prompt",
+                        timeout_seconds=5,
+                        model="gemini-4-hydrogen",
+                        tool_names=["terminal"],
+                        messages=[{"role": "tool", "content": "ok"}],
+                        tools_signature="sig",
+                    )
+                self.assertEqual(len(self.mod._ACP_POOL._sessions), 0)
+                self.assertTrue(terminated)
+            finally:
+                self.mod._ACP_POOL.close_all()
+
+    def test_stream_holds_canned_greeting_until_done_when_no_tools(self):
+        def run_fn_fail(on_chunk):
+            on_chunk("text", "Hey! What can I help you with?")
+            raise ConnectionError("Cursor ACP emitted a canned greeting instead of an assistant response.")
+
+        stream = self.mod._CursorACPStream(
+            client=object(),
+            model="gemini-4-hydrogen",
+            tool_names=[],
+            run_fn=run_fn_fail,
+        )
+        emitted = []
+        with self.assertRaises(ConnectionError):
+            for chunk in stream:
+                emitted.append(chunk)
+        self.assertEqual(emitted, [])
+
+        def run_fn_ok(on_chunk):
+            on_chunk("text", "Hey! What can I help you with?")
+            return "Hey! What can I help you with?", ""
+
+        stream_ok = self.mod._CursorACPStream(
+            client=object(),
+            model="gemini-4-hydrogen",
+            tool_names=[],
+            run_fn=run_fn_ok,
+        )
+        chunks = list(stream_ok)
+        content = "".join(c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content)
+        self.assertEqual(content, "Hey! What can I help you with?")
+
 
 if __name__ == "__main__":
     unittest.main()

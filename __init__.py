@@ -380,22 +380,6 @@ def _strip_assistant_prefixes(text: str) -> str:
     return "".join(out)
 
 
-def _consume_echoed_tool_result(text: str, start: int, decoder: json.JSONDecoder) -> int:
-    """Consume one echoed ``Tool result...`` payload starting at ``start`` and return its end index."""
-    pos = start
-    while pos < len(text) and text[pos].isspace():
-        pos += 1
-    if pos < len(text) and text[pos] == "{":
-        try:
-            _, end = decoder.raw_decode(text, pos)
-            return end
-        except ValueError:
-            nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, pos)
-            return nxt.start() if nxt else len(text)
-    nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, start)
-    return nxt.start() if nxt else len(text)
-
-
 def _consume_echoed_tool_result(text: str, start: int, decoder: json.JSONDecoder) -> int | None:
     """Consume one echoed ``Tool result...`` block starting after its header."""
     pos = start
@@ -818,22 +802,6 @@ def _is_canned_greeting_glitch(
             if core_user and not _BARE_GREETING_RE.match(core_user):
                 return True
     return False
-_CANNED_GREETING_RE = re.compile(
-    r"^(?:hey[!,.]?\s*)?(?:what can i help you with|how can i help you(?: today)?)[?!.]*$",
-    re.IGNORECASE,
-)
-_BARE_GREETING_RE = re.compile(
-    r"^(?:hi|hello|hey|yo|sup|good (?:morning|afternoon|evening))[!.,?]*$",
-    re.IGNORECASE,
-)
-_VOICE_WEB_META_RE = re.compile(r"(?m)^\[voice-web:[^\n]*\]$")
-_GREETING_HOLDBACK_PREFIXES = (
-    "hey! what can i help you with?",
-    "hey, what can i help you with?",
-    "what can i help you with?",
-    "how can i help you?",
-    "how can i help you today?",
-)
 
 
 def _echo_prefix_state(stripped: str) -> tuple[bool, bool]:
@@ -876,39 +844,6 @@ def _detect_acp_error(text: str) -> str | None:
     if after_wrapper != stripped and not after_wrapper:
         return "Cursor ACP echoed its prompt wrapper instead of returning an assistant response."
     return None
-
-
-def _greeting_prefix_possible(stripped: str) -> bool:
-    """True while ``stripped`` could still turn out to be an exact canned Cursor greeting."""
-    low = stripped.lower()
-    if not low:
-        return True
-    return any(p.startswith(low) for p in _GREETING_HOLDBACK_PREFIXES)
-
-
-def _is_canned_greeting_glitch(
-    text: str,
-    reasoning: str,
-    *,
-    messages: list[dict[str, Any]] | None = None,
-) -> bool:
-    """Return True when ``agent acp`` emitted a canned greeting instead of a real turn reply."""
-    candidate = _strip_prompt_echoes(text or "").strip()
-    if not candidate or not _CANNED_GREETING_RE.match(candidate):
-        return False
-    if reasoning and reasoning.strip():
-        return True
-    if not messages:
-        return False
-    last = messages[-1] or {}
-    last_role = str(last.get("role") or "").strip().lower()
-    if last_role == "tool":
-        return True
-    if last_role == "user":
-        user_text = _VOICE_WEB_META_RE.sub("", _render_content(last.get("content"))).strip()
-        if user_text and not _BARE_GREETING_RE.match(user_text):
-            return True
-    return False
 
 
 def _safe_prefix_end(buf: str, emitted_len: int) -> int:
