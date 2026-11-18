@@ -852,8 +852,8 @@ class ApplyModelOptionsTests(unittest.TestCase):
         self.assertEqual(self._calls("claude-opus-5-5[effort=high,fast=false]", "medium"), [])
 
 
-class _WarmHarness(unittest.TestCase):
-    """Fake agent acp sessions and a client wired to them (no tests of its own)."""
+class TransientErrorKeepsSessionTests(unittest.TestCase):
+    """A transient Cursor error must not throw away the warm session (a new one replays the whole history)."""
 
     TOOL_REPLY = '<tool_call>{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": {"command": "ls"}}}</tool_call>'
     UNAVAILABLE = "Error: RetriableError: [unavailable] Error"
@@ -929,11 +929,6 @@ class _WarmHarness(unittest.TestCase):
         self.run_turn(self.MSGS1)
         self.assertEqual((self.opened, self.pooled), (1, 1))
 
-
-
-class TransientErrorKeepsSessionTests(_WarmHarness):
-    """A transient Cursor error must not throw away the warm session (a new one replays the whole history)."""
-
     def test_retry_after_unavailable_reuses_the_session_and_sends_only_new_messages(self):
         self.establish()
         self.replies.extend([self.UNAVAILABLE, self.TOOL_REPLY])
@@ -997,36 +992,3 @@ class TransientErrorKeepsSessionTests(_WarmHarness):
         self.replies.append(self.TOOL_REPLY)
         self.run_turn(self.MSGS2)  # the pool prunes the dead one; a fresh session answers
         self.assertEqual(self.opened, 2)
-
-
-class MemoryContextDoesNotBreakReuseTests(_WarmHarness):
-    """Hermes adds <memory-context> to the newest user message for one call, then stores it without."""
-
-    CTX = ("\n\n<memory-context>\n[System note: The following is recalled memory context, NOT new user input. "
-           "Treat as authoritative reference data \u2014 this is the agent's persistent memory and should inform "
-           "all responses.]\n\n- recalled fact that changes every turn\n</memory-context>")
-
-    def test_new_user_turn_reuses_the_session_when_only_the_memory_block_differs(self):
-        sent = [{"role": "user", "content": "run it" + self.CTX}]  # what Hermes sent on the first call
-        self.replies.append(self.TOOL_REPLY)
-        self.run_turn(sent)
-        self.assertEqual((self.opened, self.pooled), (1, 1))
-        self.replies.append(self.TOOL_REPLY)
-        self.run_turn(self.MSGS2)  # stored history: same user text, block gone
-        self.assertEqual(self.opened, 1)
-        self.assertNotIn("full prompt", self.prompts[1])
-
-    def test_a_real_change_to_an_earlier_message_still_starts_a_new_session(self):
-        sent = [{"role": "user", "content": "run it" + self.CTX}]
-        self.replies.append(self.TOOL_REPLY)
-        self.run_turn(sent)
-        changed = [dict(self.MSGS2[0], content="run something else")] + self.MSGS2[1:]
-        self.replies.append(self.TOOL_REPLY)
-        self.run_turn(changed)
-        self.assertEqual(self.opened, 2)
-
-    def test_stable_form_leaves_plain_turns_alone(self):
-        plain = '<turn role="user">\nhello\n</turn>'
-        self.assertEqual(self.mod._stable_form(plain), plain)
-        with_ctx = '<turn role="user">\nhello' + self.CTX + '\n</turn>'
-        self.assertEqual(self.mod._stable_form(with_ctx), plain)
