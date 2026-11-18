@@ -732,6 +732,83 @@ class CursorACPErrorAndEchoTests(unittest.TestCase):
         content = "".join(c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content)
         self.assertEqual(content, "Hey! What can I help you with?")
 
+    def test_extract_tool_calls_accepts_namespaced_call_tags(self):
+        import json
+
+        cmd_blob = '<call:default_api:terminal>{"command":"for p in 1908 1899 1890; do echo $p; done"}</call:default_api:terminal>'
+        calls, cleaned, errors = self.mod._extract_tool_calls_with_errors(
+            cmd_blob, tool_names=["terminal"]
+        )
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].function.name, "terminal")
+        self.assertEqual(json.loads(calls[0].function.arguments), {"command": "for p in 1908 1899 1890; do echo $p; done"})
+        self.assertEqual(cleaned, "")
+
+        # A tool whose own argument is "name" must not be misclassified as a flat envelope.
+        name_arg_blob = '<call:default_api:skill_view>{"name": "ptal"}</call:default_api:skill_view>'
+        calls_sv, cleaned_sv, errors_sv = self.mod._extract_tool_calls_with_errors(
+            name_arg_blob, tool_names=["skill_view"]
+        )
+        self.assertEqual(errors_sv, [])
+        self.assertEqual(len(calls_sv), 1)
+        self.assertEqual(calls_sv[0].function.name, "skill_view")
+        self.assertEqual(json.loads(calls_sv[0].function.arguments), {"name": "ptal"})
+        self.assertEqual(cleaned_sv, "")
+
+        # Named tag wrapping a full OpenAI envelope still uses the envelope.
+        env_payload = json.dumps({
+            "id": "c1",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": json.dumps({"command": "pwd"})},
+        })
+        env_blob = f'<call:terminal>{env_payload}</call:terminal>'
+        calls_env, cleaned_env, errors_env = self.mod._extract_tool_calls_with_errors(
+            env_blob, tool_names=["terminal"]
+        )
+        self.assertEqual(errors_env, [])
+        self.assertEqual(len(calls_env), 1)
+        self.assertEqual(calls_env[0].id, "c1")
+        self.assertEqual(calls_env[0].function.name, "terminal")
+        self.assertEqual(cleaned_env, "")
+
+        # Self-closing named tag and unoffered tool tag.
+        self_closing = '<call:default_api:terminal/>'
+        calls_sc, cleaned_sc, errors_sc = self.mod._extract_tool_calls_with_errors(
+            self_closing, tool_names=["terminal"]
+        )
+        self.assertEqual(errors_sc, [])
+        self.assertEqual(len(calls_sc), 1)
+        self.assertEqual(calls_sc[0].function.name, "terminal")
+        self.assertEqual(json.loads(calls_sc[0].function.arguments), {})
+        self.assertEqual(cleaned_sc, "")
+
+        unoffered = '<call:default_api:not_offered>{"x": 1}</call:default_api:not_offered>'
+        calls_uo, cleaned_uo, errors_uo = self.mod._extract_tool_calls_with_errors(
+            unoffered, tool_names=["terminal"]
+        )
+        self.assertEqual(errors_uo, [])
+        self.assertEqual(calls_uo, [])
+        self.assertEqual(cleaned_uo, unoffered)
+
+    def test_stream_extracts_namespaced_call_tag_without_leaking(self):
+        import json
+
+        blob = '<call:default_api:terminal>{"command": "echo ok"}</call:default_api:terminal>'
+        stream = self.mod._CursorACPStream(
+            client=object(),
+            model="gemini-4-hydrogen",
+            tool_names=["terminal"],
+            run_fn=lambda on_chunk: (on_chunk("text", "Checking. "), on_chunk("text", blob)) and (f"Checking. {blob}", ""),
+        )
+        chunks = list(stream)
+        content = "".join(c.choices[0].delta.content for c in chunks if c.choices and c.choices[0].delta.content)
+        tool_calls = [tc for c in chunks if c.choices for tc in (c.choices[0].delta.tool_calls or [])]
+        self.assertEqual(content, "")
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0].function.name, "terminal")
+        self.assertEqual(json.loads(tool_calls[0].function.arguments), {"command": "echo ok"})
+
 
 if __name__ == "__main__":
     unittest.main()
