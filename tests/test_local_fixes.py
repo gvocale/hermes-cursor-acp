@@ -850,3 +850,145 @@ class ApplyModelOptionsTests(unittest.TestCase):
 
     def test_variant_id_is_left_alone(self):
         self.assertEqual(self._calls("claude-opus-5-5[effort=high,fast=false]", "medium"), [])
+
+
+class TransientErrorKeepsSessionTests(unittest.TestCase):
+    """A transient Cursor error must not throw away the warm session (a new one replays the whole history)."""
+
+    TOOL_REPLY = '<tool_call>{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": {"command": "ls"}}}</tool_call>'
+    UNAVAILABLE = "Error: RetriableError: [unavailable] Error"
+
+    MSGS1 = [{"role": "user", "content": "run it"}]
+    MSGS2 = MSGS1 + [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": "{\"command\": \"ls\"}"}}]},
+        {"role": "tool", "name": "terminal", "tool_call_id": "call_1", "content": "file.txt"},
+    ]
+
+    def setUp(self):
+        import queue
+        import tempfile
+        from collections import deque
+
+        self.mod = _load_plugin()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.client = self.mod._make_client_class()(acp_cwd=self._tmp.name)
+        self.opened = 0
+        self.prompts = []
+        self.replies = []  # one entry per session/prompt, popped from the front
+        self.terminated = []
+        outer = self
+
+        class _Proc:
+            alive = True
+
+            def poll(self):
+                return None if self.alive else 1
+
+            def terminate(self):
+                outer.terminated.append(self)
+                self.alive = False
+
+            def wait(self, timeout=None):
+                pass
+
+            def kill(self):
+                self.alive = False
+
+        def fake_open(**kw):
+            self.opened += 1
+            return self.mod._WarmACPSession(
+                proc=_Proc(), inbox=queue.Queue(), stderr_tail=deque(maxlen=40), stderr_pump=None,
+                request_ids=iter(range(1, 100)), session_id=f"s{self.opened}", config_key=kw["config_key"])
+
+        def fake_request(sess, method, params, **kw):
+            if method == "session/prompt":
+                self.prompts.append(params["prompt"][0]["text"])
+                kw["text_parts"].append(self.replies.pop(0))
+            return {}
+
+        self.client._open_warm_session = fake_open
+        self.client._session_request = fake_request
+        self.mod._ACP_POOL.close_all()
+
+    def tearDown(self):
+        self.mod._ACP_POOL.close_all()
+        self._tmp.cleanup()
+
+    @property
+    def pooled(self):
+        return len(self.mod._ACP_POOL._sessions)
+
+    def run_turn(self, messages):
+        return self.client._run_prompt(
+            "full prompt", timeout_seconds=5, model="gemini-4-hydrogen", tool_names=["terminal"],
+            messages=messages, tools_signature="sig")
+
+    def establish(self):
+        self.replies.append(self.TOOL_REPLY)
+        self.run_turn(self.MSGS1)
+        self.assertEqual((self.opened, self.pooled), (1, 1))
+
+    def test_retry_after_unavailable_reuses_the_session_and_sends_only_new_messages(self):
+        self.establish()
+        self.replies.extend([self.UNAVAILABLE, self.TOOL_REPLY])
+        with self.assertRaises(ConnectionError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(self.pooled, 1)  # kept, not terminated
+        self.assertEqual(self.terminated, [])
+        self.run_turn(self.MSGS2)  # Hermes' own retry: same messages
+        self.assertEqual(self.opened, 1)  # no new agent acp
+        self.assertEqual(len(self.prompts), 3)
+        self.assertEqual(self.prompts[1], self.prompts[2])  # the same new messages, not the replayed history
+        self.assertNotEqual(self.prompts[0], self.prompts[2])
+
+    def test_resource_exhausted_also_keeps_the_session(self):
+        self.establish()
+        self.replies.append("Error: RetriableError: [resource_exhausted] Error")
+        with self.assertRaises(ConnectionError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(self.pooled, 1)
+
+    def test_closed_stream_error_drops_the_session(self):
+        self.establish()
+        self.replies.append("Error: RetriableError: WritableIterable is closed")
+        with self.assertRaises(ConnectionError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(self.pooled, 0)
+        self.assertEqual(len(self.terminated), 1)
+
+    def test_non_retriable_error_drops_the_session(self):
+        self.establish()
+        self.replies.append("Error: NonRetriableError: [unavailable] Error")
+        with self.assertRaises(ConnectionError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(self.pooled, 0)
+
+    def test_fresh_session_that_fails_is_dropped(self):
+        self.replies.append(self.UNAVAILABLE)
+        with self.assertRaises(ConnectionError):
+            self.run_turn(self.MSGS1)
+        self.assertEqual(self.pooled, 0)  # nothing was sent yet, so a retry could never match it
+
+    def test_session_is_dropped_after_three_failed_turns_in_a_row(self):
+        self.establish()
+        self.replies.extend([self.UNAVAILABLE] * 3)
+        for expected_pooled in (1, 1, 0):
+            with self.assertRaises(ConnectionError):
+                self.run_turn(self.MSGS2)
+            self.assertEqual(self.pooled, expected_pooled)
+
+    def test_a_good_turn_resets_the_failure_count(self):
+        self.establish()
+        self.replies.extend([self.UNAVAILABLE, self.TOOL_REPLY])
+        with self.assertRaises(ConnectionError):
+            self.run_turn(self.MSGS2)
+        self.run_turn(self.MSGS2)
+        self.assertEqual(self.mod._ACP_POOL._sessions[0].failed_turns, 0)
+
+    def test_dead_process_is_not_kept(self):
+        self.establish()
+        self.mod._ACP_POOL._sessions[0].proc.alive = False
+        self.replies.append(self.TOOL_REPLY)
+        self.run_turn(self.MSGS2)  # the pool prunes the dead one; a fresh session answers
+        self.assertEqual(self.opened, 2)
