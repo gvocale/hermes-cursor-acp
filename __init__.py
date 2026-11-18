@@ -380,6 +380,38 @@ def _strip_assistant_prefixes(text: str) -> str:
     return "".join(out)
 
 
+def _consume_echoed_tool_result(text: str, start: int, decoder: json.JSONDecoder) -> int:
+    """Consume one echoed ``Tool result...`` payload starting at ``start`` and return its end index."""
+    pos = start
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    if pos < len(text) and text[pos] == "{":
+        try:
+            _, end = decoder.raw_decode(text, pos)
+            return end
+        except ValueError:
+            nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, pos)
+            return nxt.start() if nxt else len(text)
+    nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, start)
+    return nxt.start() if nxt else len(text)
+
+
+def _consume_echoed_tool_result(text: str, start: int, decoder: json.JSONDecoder) -> int | None:
+    """Consume one echoed ``Tool result...`` block starting after its header."""
+    pos = start
+    while pos < len(text) and text[pos].isspace():
+        pos += 1
+    if pos < len(text) and text[pos] == "{":
+        try:
+            _, end = decoder.raw_decode(text, pos)
+            return end
+        except ValueError:
+            nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, pos)
+            return nxt.start() if nxt else len(text)
+    nxt = _PROMPT_ECHO_BOUNDARY_RE.search(text, start)
+    return nxt.start() if nxt else len(text)
+
+
 def _strip_prompt_echoes(text: str) -> str:
     """Remove synthetic harness wrapper headers, `Tool result:` blocks, and leaked `Assistant:` prefixes."""
     if not text:
@@ -739,6 +771,69 @@ _ECHO_PREFIXES = (
     "Error: NonRetriableError:",
 )
 _ACP_ERROR_LINE_RE = re.compile(r"(?m)^Error:\s*((?:Non)?RetriableError):\s*(.+)$")
+_CANNED_GREETING_RE = re.compile(
+    r"^(?:hey[!,.]?\s*)?(?:what can i help you with|how can i help you(?: today)?)[?!.]*$",
+    re.IGNORECASE,
+)
+_BARE_GREETING_RE = re.compile(
+    r"^(?:hi|hello|hey|yo|sup|good (?:morning|afternoon|evening))[!.,?]*$",
+    re.IGNORECASE,
+)
+_CANNED_GREETING_PREFIXES = (
+    "hey! what can i help you with?",
+    "hey, what can i help you with?",
+    "what can i help you with?",
+    "how can i help you?",
+    "how can i help you today?",
+)
+
+
+def _is_canned_greeting_prefix(stripped: str) -> bool:
+    low = stripped.lower()
+    return any(p.startswith(low) for p in _CANNED_GREETING_PREFIXES)
+
+
+def _is_canned_greeting_glitch(
+    text: str,
+    reasoning: str = "",
+    *,
+    messages: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return True when ACP emitted a generic Cursor greeting instead of a real turn reply."""
+    candidate = _strip_prompt_echoes(text).strip()
+    if not candidate or not _CANNED_GREETING_RE.match(candidate):
+        return False
+    if isinstance(reasoning, str) and reasoning.strip():
+        return True
+    if messages:
+        last = messages[-1] if isinstance(messages[-1], dict) else {}
+        last_role = str(last.get("role") or "").strip().lower()
+        if last_role == "tool":
+            return True
+        if last_role == "user":
+            raw_user = _render_content(last.get("content")).strip()
+            # Strip trailing [voice-web: ...] / [Image: ...] metadata lines when checking bare greetings.
+            user_lines = [ln.strip() for ln in raw_user.splitlines() if ln.strip() and not ln.strip().startswith("[")]
+            core_user = " ".join(user_lines).strip()
+            if core_user and not _BARE_GREETING_RE.match(core_user):
+                return True
+    return False
+_CANNED_GREETING_RE = re.compile(
+    r"^(?:hey[!,.]?\s*)?(?:what can i help you with|how can i help you(?: today)?)[?!.]*$",
+    re.IGNORECASE,
+)
+_BARE_GREETING_RE = re.compile(
+    r"^(?:hi|hello|hey|yo|sup|good (?:morning|afternoon|evening))[!.,?]*$",
+    re.IGNORECASE,
+)
+_VOICE_WEB_META_RE = re.compile(r"(?m)^\[voice-web:[^\n]*\]$")
+_GREETING_HOLDBACK_PREFIXES = (
+    "hey! what can i help you with?",
+    "hey, what can i help you with?",
+    "what can i help you with?",
+    "how can i help you?",
+    "how can i help you today?",
+)
 
 
 def _echo_prefix_state(stripped: str) -> tuple[bool, bool]:
@@ -781,6 +876,39 @@ def _detect_acp_error(text: str) -> str | None:
     if after_wrapper != stripped and not after_wrapper:
         return "Cursor ACP echoed its prompt wrapper instead of returning an assistant response."
     return None
+
+
+def _greeting_prefix_possible(stripped: str) -> bool:
+    """True while ``stripped`` could still turn out to be an exact canned Cursor greeting."""
+    low = stripped.lower()
+    if not low:
+        return True
+    return any(p.startswith(low) for p in _GREETING_HOLDBACK_PREFIXES)
+
+
+def _is_canned_greeting_glitch(
+    text: str,
+    reasoning: str,
+    *,
+    messages: list[dict[str, Any]] | None = None,
+) -> bool:
+    """Return True when ``agent acp`` emitted a canned greeting instead of a real turn reply."""
+    candidate = _strip_prompt_echoes(text or "").strip()
+    if not candidate or not _CANNED_GREETING_RE.match(candidate):
+        return False
+    if reasoning and reasoning.strip():
+        return True
+    if not messages:
+        return False
+    last = messages[-1] or {}
+    last_role = str(last.get("role") or "").strip().lower()
+    if last_role == "tool":
+        return True
+    if last_role == "user":
+        user_text = _VOICE_WEB_META_RE.sub("", _render_content(last.get("content"))).strip()
+        if user_text and not _BARE_GREETING_RE.match(user_text):
+            return True
+    return False
 
 
 def _safe_prefix_end(buf: str, emitted_len: int) -> int:
@@ -951,8 +1079,11 @@ class _CursorACPStream:
                     self._emitted_len = len(self._raw_text) - len(stripped)
                     self._started_text = True
                 if not self._echo_cleared:
-                    definite, possible = _echo_prefix_state(self._raw_text[self._emitted_len:])
+                    tail = self._raw_text[self._emitted_len:]
+                    definite, possible = _echo_prefix_state(tail)
                     if definite or possible:
+                        continue
+                    if not self._tool_names and _is_canned_greeting_prefix(tail.strip()):
                         continue
                     self._echo_cleared = True
                 if not self._tool_names:
@@ -1282,12 +1413,17 @@ def _make_client_class():
 
         def _run_prompt_turn(self, *, ask: Any, model: str | None, tool_names: list[str] | None,
                              effective_prompt: str, effective_images: list[dict[str, str]] | None = None,
+                             messages: list[dict[str, Any]] | None = None,
                              on_reusable: Any = None) -> tuple[str, str]:
             native = self._native_attempts()
             native.clear()
             text, reasoning = ask(effective_prompt, images=effective_images)
             if (acp_err := _detect_acp_error(text)) is not None:
                 raise ConnectionError(acp_err)
+            if _is_canned_greeting_glitch(text, reasoning, messages=messages):
+                raise ConnectionError(
+                    "Cursor ACP emitted a canned greeting instead of an assistant response."
+                )
             if tool_names:
                 parsed_calls, _cleaned, call_errors = _extract_tool_calls_with_errors(text, tool_names)
                 if parsed_calls:
@@ -1382,6 +1518,7 @@ def _make_client_class():
                         return self._run_prompt_turn(
                             ask=ask, model=model, tool_names=tool_names,
                             effective_prompt=prompt_text, effective_images=list(prompt_images or ()),
+                            messages=messages,
                         )
                 finally:
                     self._native.on_chunk = None
@@ -1431,6 +1568,7 @@ def _make_client_class():
                 return self._run_prompt_turn(
                     ask=ask, model=model, tool_names=tool_names,
                     effective_prompt=effective_prompt, effective_images=effective_images,
+                    messages=msgs,
                     on_reusable=_mark_reusable,
                 )
             finally:
