@@ -724,6 +724,29 @@ def _terminate_proc(proc: subprocess.Popen[str]) -> None:
             proc.kill()
 
 
+def _stable_form(rendered: str) -> str:
+    """A rendered turn with Hermes' per-call recalled-memory block removed, for comparing conversations.
+
+    Hermes adds ``<memory-context>`` to the latest user message for that turn only, and stores the message
+    without it. Compared raw, the stored copy never matches what the warm session was sent, so every new user
+    turn would start a new ``agent acp`` and replay the whole history as uncached input.
+    """
+    try:
+        from agent.memory_context import sanitize_context
+    except Exception:  # older Hermes without the helper: fall back to exact matching
+        return rendered
+    cleaned = sanitize_context(rendered)
+    return re.sub(r"\s+</turn>$", "\n</turn>", cleaned.strip()) if cleaned != rendered else rendered
+
+
+def _same_conversation_prefix(rendered: list[str], sent: list[str]) -> bool:
+    """True when the first ``len(sent)`` rendered turns are what the session was sent."""
+    n = len(sent)
+    if rendered[:n] == sent:
+        return True
+    return [_stable_form(r) for r in rendered[:n]] == [_stable_form(r) for r in sent]
+
+
 class _ACPSessionPool:
     """Module-level pool of idle warm ``agent acp`` sessions keyed by config + message prefix."""
 
@@ -756,7 +779,7 @@ class _ACPSessionPool:
                     continue
                 n = len(s.sent_rendered)
                 # Expect: messages[:n] == prior sent, messages[n] == assistant reply, messages[n+1:] == new delta
-                if n > 0 and len(messages) > n + 1 and rendered[:n] == s.sent_rendered:
+                if n > 0 and len(messages) > n + 1 and _same_conversation_prefix(rendered, s.sent_rendered):
                     if str((messages[n] or {}).get("role") or "").lower() == "assistant" and n > best_len:
                         best_len = n
                         match_idx = idx
@@ -775,9 +798,9 @@ class _ACPSessionPool:
         if not same:
             logger.info("cursor-acp warm-session miss: no idle session (pool=%d, msgs=%d)", len(self._sessions), len(messages))
             return
-        best = max(same, key=lambda s: sum(1 for a, b in zip(rendered, s.sent_rendered) if a == b))
+        best = max(same, key=lambda s: sum(1 for a, b in zip(rendered, s.sent_rendered) if _stable_form(a) == _stable_form(b)))
         n = len(best.sent_rendered)
-        diverge = next((i for i, (a, b) in enumerate(zip(rendered, best.sent_rendered)) if a != b), None)
+        diverge = next((i for i, (a, b) in enumerate(zip(rendered, best.sent_rendered)) if _stable_form(a) != _stable_form(b)), None)
         logger.info("cursor-acp warm-session miss: msgs=%d sent=%d first_diff_index=%s next_role=%s",
                     len(messages), n, diverge,
                     str((messages[n] or {}).get("role")) if len(messages) > n else "n/a")
