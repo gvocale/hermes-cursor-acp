@@ -1019,14 +1019,14 @@ class PoolCapacityTests(unittest.TestCase):
         return self.mod._pool_capacity()
 
     def test_default_override_and_bad_values(self):
-        self.assertEqual(self._capacity(None), 24)
+        self.assertEqual(self._capacity(None), 100)
         self.assertEqual(self._capacity("40"), 40)
         self.assertEqual(self._capacity(" 3 "), 3)
         for bad in ("0", "-2", "many", "1.5"):
-            self.assertEqual(self._capacity(bad), 24, bad)
+            self.assertEqual(self._capacity(bad), 100, bad)
 
     def test_pool_uses_the_configured_capacity(self):
-        self.assertEqual(self.mod._ACPSessionPool()._max_sessions, 24)
+        self.assertEqual(self.mod._ACPSessionPool()._max_sessions, 100)
         self.assertEqual(self.mod._ACPSessionPool(max_sessions=5)._max_sessions, 5)
 
     # --- chats taking turns against a pool, with fake sessions -------------------------------------------------

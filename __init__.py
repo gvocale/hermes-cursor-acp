@@ -724,17 +724,19 @@ def _terminate_proc(proc: subprocess.Popen[str]) -> None:
             proc.kill()
 
 
-_DEFAULT_POOL_MAX = 24
+_DEFAULT_POOL_MAX = 100
 _POOL_MAX_ENV = "HERMES_CURSOR_ACP_POOL_MAX"
 
 
 def _pool_capacity() -> int:
-    """How many idle warm sessions the pool keeps, from ``HERMES_CURSOR_ACP_POOL_MAX`` (default 24).
+    """How many idle warm sessions the pool keeps, from ``HERMES_CURSOR_ACP_POOL_MAX`` (default 100).
 
-    One warm session is one ``agent acp`` process, about 250 MB resident. A chat only gets its session back
-    if it is still in the pool, so the capacity has to cover the chats active within the idle window: with 19
-    chats active in 10 minutes, a pool of 8 sent 38% of calls cold (the whole conversation replayed as
-    uncached input) against 14% at 24.
+    One warm session is one ``agent acp`` process, about 250 MB resident, so the ceiling is about 25 GB. A chat
+    only gets its session back if it is still in the pool, so the capacity has to cover the chats active within
+    the idle window: with 19 chats active in 10 minutes, a pool of 8 sent 38% of calls cold (the whole
+    conversation replayed as uncached input) against 14% at 24. The owner runs 22 chats at once on the work
+    page and about twice that on the personal page, hence 100. Sessions idle for 10 minutes are closed, so the
+    pool only holds as many processes as there are chats used within that window.
     """
     raw = os.environ.get(_POOL_MAX_ENV, "").strip()
     if not raw:
