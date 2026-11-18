@@ -711,6 +711,7 @@ class _WarmACPSession:
         self.session_id = session_id
         self.config_key = config_key
         self.sent_rendered = list(sent_rendered or [])
+        self.failed_turns = 0  # consecutive turns that ended in a transient upstream error
         self.last_used_at = time.monotonic()
 
 
@@ -919,6 +920,26 @@ def _detect_acp_error(text: str) -> str | None:
     return None
 
 
+# Errors where Cursor said "try again" before the model produced anything. The `agent acp` process and the
+# conversation it holds are still good. `WritableIterable is closed` is not in this list: that session is dead.
+_TRANSIENT_UPSTREAM_RE = re.compile(r"(?<!Non)RetriableError:\s*\[(?:unavailable|resource_exhausted)\]")
+# A session that fails this many turns in a row is dropped, in case Cursor keeps a half-recorded prompt.
+_MAX_CONSECUTIVE_FAILED_TURNS = 3
+
+
+class UpstreamTurnError(ConnectionError):
+    """Cursor ended a turn with an error line. ``session_intact`` says the warm session can serve the retry.
+
+    A failed turn changes nothing about what the session has been sent, so the retry that Hermes makes with the
+    same messages can reuse the session and send only the new messages, instead of replaying the whole
+    conversation to a new ``agent acp`` (billed as uncached input).
+    """
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.session_intact = bool(_TRANSIENT_UPSTREAM_RE.search(message))
+
+
 def _safe_prefix_end(buf: str, emitted_len: int) -> int:
     """End index up to which ``buf[emitted_len:]`` is guaranteed not to start a tool call."""
     tail = buf[emitted_len:]
@@ -1109,7 +1130,7 @@ class _CursorACPStream:
                 self._done = True
                 full_text, _full_reasoning = payload
                 if (acp_err := _detect_acp_error(full_text)) is not None:
-                    raise ConnectionError(acp_err)
+                    raise UpstreamTurnError(acp_err)
                 tool_calls, cleaned, call_errors = _extract_tool_calls_with_errors(full_text, self._tool_names)
                 if not tool_calls and call_errors:
                     raise ConnectionError(
@@ -1422,7 +1443,7 @@ def _make_client_class():
             native.clear()
             text, reasoning = ask(effective_prompt, images=effective_images)
             if (acp_err := _detect_acp_error(text)) is not None:
-                raise ConnectionError(acp_err)
+                raise UpstreamTurnError(acp_err)
             if _is_canned_greeting_glitch(text, reasoning, messages=messages):
                 raise ConnectionError(
                     "Cursor ACP emitted a canned greeting instead of an assistant response."
@@ -1443,7 +1464,7 @@ def _make_client_class():
                         )
                     )
                     if (acp_err := _detect_acp_error(retry_text)) is not None:
-                        raise ConnectionError(acp_err)
+                        raise UpstreamTurnError(acp_err)
                     retry_calls, _retry_cleaned, retry_errors = _extract_tool_calls_with_errors(retry_text, tool_names)
                     if retry_calls:
                         if on_reusable is not None:
@@ -1469,7 +1490,7 @@ def _make_client_class():
                         "re-prompting once", model, kinds)
             retry_text, retry_reasoning = ask(_NATIVE_REFUSED_NUDGE.format(names=", ".join(tool_names)))
             if (acp_err := _detect_acp_error(retry_text)) is not None:
-                raise ConnectionError(acp_err)
+                raise UpstreamTurnError(acp_err)
             if on_reusable is not None:
                 on_reusable()
             if extract_tool_calls(retry_text, tool_names)[0]:
@@ -1546,6 +1567,7 @@ def _make_client_class():
             deadline = time.monotonic() + timeout_seconds
             self._native.on_chunk = on_chunk
             reusable = False
+            survives_failure = False
             try:
                 def ask(text: str, images: list[dict[str, str]] | None = None) -> tuple[str, str]:
                     text_parts: list[str] = []
@@ -1570,13 +1592,30 @@ def _make_client_class():
                     messages=msgs,
                     on_reusable=_mark_reusable,
                 )
+            except UpstreamTurnError as exc:
+                # Keep an established session across a transient upstream error. A session that has not yet
+                # been sent anything (sent_rendered is empty) can never match a retry, so it is not kept.
+                survives_failure = (
+                    exc.session_intact and bool(sess.sent_rendered) and sess.proc.poll() is None
+                    and sess.failed_turns + 1 < _MAX_CONSECUTIVE_FAILED_TURNS
+                )
+                if survives_failure:
+                    sess.failed_turns += 1
+                    logger.info("cursor-acp: keeping warm session after transient upstream error (%s); "
+                                "the retry reuses it", exc)
+                raise
             finally:
                 self._native.on_chunk = None
                 if reusable:
                     with self._active_process_lock:
                         self._active_processes.discard(sess.proc)
                     sess.sent_rendered = rendered
+                    sess.failed_turns = 0
                     _ACP_POOL.checkin(sess)
+                elif survives_failure:
+                    with self._active_process_lock:
+                        self._active_processes.discard(sess.proc)
+                    _ACP_POOL.checkin(sess)  # sent_rendered is unchanged: the retry sends the same new messages
                 else:
                     self._release_process(sess.proc)
 
