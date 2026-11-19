@@ -72,6 +72,8 @@ Do not allow Cursor native tools to work around a bridge failure; report a redac
 | --- | --- |
 | `HERMES_CURSOR_ACP_ARGS` | `acp`; arguments passed to the Cursor CLI |
 | `HERMES_CURSOR_ACP_MODE` | `agent`; Cursor session mode |
+| `HERMES_CURSOR_ACP_TRANSIENT_RETRIES` | `1`; how many times the plugin re-sends a turn in the same session when Cursor ended it with a transient transport error (`[unavailable]`, `[resource_exhausted]`, `[canceled]`, `[aborted]`) and no answer. Max 3, `0` turns it off. Hermes' own 3-attempt retry still applies to the error the plugin raises afterwards. Never retried: `NonRetriableError`, `WritableIterable is closed`, or a turn that already streamed answer text |
+| `HERMES_CURSOR_ACP_TRANSIENT_BACKOFF` | `2,5,10`; seconds to wait before each in-plugin retry |
 | `HERMES_CURSOR_ACP_CWD` | `$HERMES_HOME/cache/cursor-acp-workspace`; keep this separate from your projects because the plugin rewrites its `.cursor/cli.json` |
 
 Remove the plugin with `npx hermes-cursor-acp uninstall`.

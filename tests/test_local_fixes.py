@@ -852,8 +852,10 @@ class ApplyModelOptionsTests(unittest.TestCase):
         self.assertEqual(self._calls("claude-opus-5-5[effort=high,fast=false]", "medium"), [])
 
 
-class TransientErrorKeepsSessionTests(unittest.TestCase):
-    """A transient Cursor error must not throw away the warm session (a new one replays the whole history)."""
+class _SessionHarness(unittest.TestCase):
+    """Warm-session fixture: fake agent acp process; replies are popped per session/prompt."""
+
+    RETRIES = "0"  # in-plugin retries: off here, so Hermes' own retry path is what the base tests see
 
     TOOL_REPLY = '<tool_call>{"id": "call_1", "type": "function", "function": {"name": "terminal", "arguments": {"command": "ls"}}}</tool_call>'
     UNAVAILABLE = "Error: RetriableError: [unavailable] Error"
@@ -870,6 +872,13 @@ class TransientErrorKeepsSessionTests(unittest.TestCase):
         import tempfile
         from collections import deque
 
+        import os
+        from unittest import mock
+
+        patcher = mock.patch.dict(os.environ, {
+            "HERMES_CURSOR_ACP_TRANSIENT_RETRIES": self.RETRIES, "HERMES_CURSOR_ACP_TRANSIENT_BACKOFF": "0"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.mod = _load_plugin()
         self._tmp = tempfile.TemporaryDirectory()
         self.client = self.mod._make_client_class()(acp_cwd=self._tmp.name)
@@ -929,6 +938,7 @@ class TransientErrorKeepsSessionTests(unittest.TestCase):
         self.run_turn(self.MSGS1)
         self.assertEqual((self.opened, self.pooled), (1, 1))
 
+class TransientErrorKeepsSessionTests(_SessionHarness):
     def test_retry_after_unavailable_reuses_the_session_and_sends_only_new_messages(self):
         self.establish()
         self.replies.extend([self.UNAVAILABLE, self.TOOL_REPLY])
@@ -992,6 +1002,142 @@ class TransientErrorKeepsSessionTests(unittest.TestCase):
         self.replies.append(self.TOOL_REPLY)
         self.run_turn(self.MSGS2)  # the pool prunes the dead one; a fresh session answers
         self.assertEqual(self.opened, 2)
+
+
+class InPluginRetryTests(_SessionHarness):
+    """INFRA-1664: a turn Cursor ends with a transport error and no answer is re-sent once in the same session."""
+
+    RETRIES = "1"
+    ANSWER = "All done."
+
+    def prompts_sent(self):
+        return len(self.prompts)
+
+    def test_error_only_turn_is_retried_once_and_answered(self):
+        self.establish()
+        self.replies.extend(["\n\nError: RetriableError: [unavailable] Error", self.ANSWER])
+        text, _ = self.run_turn(self.MSGS2)
+        self.assertEqual(text, self.ANSWER)
+        self.assertEqual(len(self.prompts), 3)  # establish + failed + retry
+        self.assertEqual(self.prompts[1], self.prompts[2])
+        self.assertEqual(self.opened, 1)  # same session
+        self.assertEqual(self.terminated, [])
+
+    def test_retry_budget_exhausted_raises_with_the_cursor_error_and_keeps_session(self):
+        self.establish()
+        self.replies.extend([self.UNAVAILABLE, "Error: RetriableError: [unavailable] Error again"])
+        with self.assertRaises(self.mod.UpstreamTurnError) as ctx:
+            self.run_turn(self.MSGS2)
+        self.assertIn("[unavailable] Error again", str(ctx.exception))
+        self.assertEqual(len(self.prompts), 3)  # 1 retry, not more: Hermes' loop does the rest
+        self.assertEqual(self.pooled, 1)
+
+    def test_retries_can_be_turned_off(self):
+        import os
+        os.environ["HERMES_CURSOR_ACP_TRANSIENT_RETRIES"] = "0"
+        self.establish()
+        self.replies.append(self.UNAVAILABLE)
+        with self.assertRaises(self.mod.UpstreamTurnError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(len(self.prompts), 2)
+
+    def test_answer_then_trailing_error_is_not_retried_in_plugin(self):
+        self.establish()
+        self.replies.append("Here is the plan.\n\nError: RetriableError: [unavailable] Error")
+        with self.assertRaises(self.mod.UpstreamTurnError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(len(self.prompts), 2)  # already-streamed text cannot be unsent; Hermes retries
+
+    def test_discussed_error_text_is_not_an_error(self):
+        self.establish()
+        reply = "Cursor prints:\nError: RetriableError: [unavailable] Error\nwhen the link drops; retry then."
+        self.replies.append(reply)
+        text, _ = self.run_turn(self.MSGS2)
+        self.assertEqual(text, reply)
+        self.assertEqual(len(self.prompts), 2)
+
+    def test_non_retriable_is_never_retried(self):
+        self.establish()
+        self.replies.append("\n\nError: NonRetriableError: Agent Looping Detected The model got stuck.")
+        with self.assertRaises(self.mod.UpstreamTurnError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(self.pooled, 0)
+
+    def test_dead_stream_error_is_not_retried_in_this_session(self):
+        self.establish()
+        self.replies.append("Error: RetriableError: WritableIterable is closed")
+        with self.assertRaises(self.mod.UpstreamTurnError):
+            self.run_turn(self.MSGS2)
+        self.assertEqual(len(self.prompts), 2)
+        self.assertEqual(self.pooled, 0)
+
+    def test_native_attempt_in_failed_turn_gets_a_continue_message_not_a_resend(self):
+        self.establish()
+        orig = self.client._session_request
+
+        def with_native(sess, method, params, **kw):
+            if method == "session/prompt" and len(self.prompts) == 1:
+                self.client._native_attempts()["t1"] = {"kind": "execute"}
+            return orig(sess, method, params, **kw)
+
+        self.client._session_request = with_native
+        self.replies.extend([self.UNAVAILABLE, self.ANSWER])
+        text, _ = self.run_turn(self.MSGS2)
+        self.assertEqual(text, self.ANSWER)
+        self.assertEqual(self.prompts[2], self.mod._CONTINUE_NUDGE)
+
+
+class TransportErrorDetectionTests(unittest.TestCase):
+    def setUp(self):
+        self.mod = _load_plugin()
+
+    def test_each_transport_signature_is_detected_on_the_last_line(self):
+        for body in (
+            "RetriableError: [unavailable] Error", "RetriableError: [resource_exhausted] Error",
+            "ConnectError: [canceled] http/2 stream closed with error code CANCEL",
+            "ConnectError: [aborted] x", "RetriableError: WritableIterable is closed",
+            "[unavailable] PING timed out", "Something went wrong communicating with the server",
+        ):
+            with self.subTest(body=body):
+                self.assertIn(body, self.mod._detect_acp_error("\n\nError: " + body) or "")
+
+    def test_non_error_and_mid_answer_lines_are_not_errors(self):
+        d = self.mod._detect_acp_error
+        self.assertIsNone(d("Error: something unrelated broke in your code"))
+        self.assertIsNone(d("Error: RetriableError: [unavailable] Error\nbut that is what Cursor prints, fine."))
+        self.assertIsNone(d("fine answer"))
+
+    def test_session_intact_only_for_transient_non_dead_errors(self):
+        E = self.mod.UpstreamTurnError
+        self.assertTrue(E("RetriableError: [unavailable] x").session_intact)
+        self.assertTrue(E("ConnectError: [canceled] x").session_intact)
+        self.assertFalse(E("NonRetriableError: [unavailable] x").session_intact)
+        self.assertFalse(E("RetriableError: WritableIterable is closed").session_intact)
+
+    def test_stream_holds_a_trailing_error_chunk_and_raises(self):
+        err = "\n\nError: RetriableError: [unavailable] Error"
+
+        def run_fn(on_chunk):
+            on_chunk("text", "Partial answer.\n")
+            on_chunk("text", err)
+            return "Partial answer.\n" + err, ""
+
+        stream = self.mod._CursorACPStream(client=object(), model="m", tool_names=[], run_fn=run_fn)
+        emitted = []
+        with self.assertRaises(ConnectionError):
+            for chunk in stream:
+                emitted.append(chunk.choices[0].delta.content or "")
+        self.assertNotIn("Error:", "".join(emitted))
+
+    def test_stream_releases_a_line_starting_with_error_when_it_is_no_error(self):
+        def run_fn(on_chunk):
+            on_chunk("text", "Error: handled in the caller.\nDone.")
+            return "Error: handled in the caller.\nDone.", ""
+
+        stream = self.mod._CursorACPStream(client=object(), model="m", tool_names=[], run_fn=run_fn)
+        got = "".join((c.choices[0].delta.content or "") for c in stream if getattr(c, "choices", None))
+        self.assertEqual(got, "Error: handled in the caller.\nDone.")
 
 
 class PoolCapacityTests(unittest.TestCase):
