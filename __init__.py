@@ -892,7 +892,14 @@ _ECHO_PREFIXES = (
     "Error: RetriableError:",
     "Error: NonRetriableError:",
 )
-_ACP_ERROR_LINE_RE = re.compile(r"(?m)^Error:\s*((?:Non)?RetriableError):\s*(.+)$")
+# A Cursor transport failure reaches the client as a trailing ``agent_message_chunk`` ("\n\nError: ...") followed
+# by ``end_turn``, so it looks like an answer. Only the LAST line of the turn counts: an answer that merely
+# discusses an error is never matched.
+_ACP_ERROR_TAIL_RE = re.compile(r"(?m)^[ \t]*Error:[ \t]*(?P<body>\S[^\n]*?)[ \t]*\s*\Z")
+_ACP_TRANSIENT_SIGNATURE_RE = re.compile(
+    r"(?<!Non)RetriableError|ConnectError|\[(?:unavailable|canceled|aborted|resource_exhausted)\]"
+    r"|WritableIterable is closed|PING timed out|Something went wrong communicating with the server"
+)
 _CANNED_GREETING_RE = re.compile(
     r"^(?:hey[!,.]?\s*)?(?:what can i help you with|how can i help you(?: today)?)[?!.]*$",
     re.IGNORECASE,
@@ -972,9 +979,11 @@ def _detect_acp_error(text: str) -> str | None:
     """Return a retryable error message when ``agent acp`` echoes its prompt wrapper or emits a terminal error."""
     if not isinstance(text, str) or not text:
         return None
-    m = _ACP_ERROR_LINE_RE.search(text)
+    m = _ACP_ERROR_TAIL_RE.search(text)
     if m:
-        return f"Cursor ACP upstream error: {m.group(1)}: {m.group(2).strip()}"
+        body = m.group("body")
+        if body.startswith("NonRetriableError") or _ACP_TRANSIENT_SIGNATURE_RE.search(body):
+            return f"Cursor ACP upstream error: {body}"
     after_wrapper = _HARNESS_WRAPPER_ECHO_RE.sub("", text, count=1).lstrip()
     stripped = text.lstrip()
     if stripped.startswith("HARNESS OVERRIDE") or after_wrapper.startswith("HARNESS OVERRIDE"):
@@ -986,7 +995,51 @@ def _detect_acp_error(text: str) -> str | None:
 
 # Errors where Cursor said "try again" before the model produced anything. The `agent acp` process and the
 # conversation it holds are still good. `WritableIterable is closed` is not in this list: that session is dead.
-_TRANSIENT_UPSTREAM_RE = re.compile(r"(?<!Non)RetriableError:\s*\[(?:unavailable|resource_exhausted)\]")
+_TRANSIENT_UPSTREAM_RE = re.compile(r"\[(?:unavailable|resource_exhausted|canceled|aborted)\]")
+# In-plugin retry of a turn that ended with such an error and produced no answer. Hermes' own loop in
+# agent.conversation_loop retries a raised UpstreamTurnError up to 3 times, so the plugin adds ONE quick retry
+# (default) instead of 3: worst case is 2 x 3 = 6 sends, not 9. Set HERMES_CURSOR_ACP_TRANSIENT_RETRIES=0 to
+# turn it off; HERMES_CURSOR_ACP_TRANSIENT_BACKOFF is a comma list of seconds (default 2,5,10).
+_TRANSIENT_RETRIES_ENV = "HERMES_CURSOR_ACP_TRANSIENT_RETRIES"
+_TRANSIENT_BACKOFF_ENV = "HERMES_CURSOR_ACP_TRANSIENT_BACKOFF"
+_DEFAULT_TRANSIENT_RETRIES = 1
+_MAX_TRANSIENT_RETRIES = 3
+_DEFAULT_TRANSIENT_BACKOFF = (2.0, 5.0, 10.0)
+_CONTINUE_NUDGE = "The previous reply was cut off by a connection error. Continue from where you stopped."
+
+
+def _transient_retries() -> int:
+    raw = os.environ.get(_TRANSIENT_RETRIES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_TRANSIENT_RETRIES
+    try:
+        return max(0, min(int(raw), _MAX_TRANSIENT_RETRIES))
+    except ValueError:
+        logger.warning("cursor-acp: ignoring %s=%r (need a whole number); using %d",
+                       _TRANSIENT_RETRIES_ENV, raw, _DEFAULT_TRANSIENT_RETRIES)
+        return _DEFAULT_TRANSIENT_RETRIES
+
+
+def _transient_backoff(attempt: int) -> float:
+    """Seconds to wait before retry number ``attempt`` (1-based)."""
+    values: list[float] = []
+    for part in os.environ.get(_TRANSIENT_BACKOFF_ENV, "").split(","):
+        try:
+            values.append(max(0.0, float(part)))
+        except ValueError:
+            continue
+    values = values or list(_DEFAULT_TRANSIENT_BACKOFF)
+    return values[min(attempt, len(values)) - 1]
+
+
+def _answer_before_error_tail(text: str) -> str:
+    """The turn's text before its trailing error line, minus any echoed prompt wrapper."""
+    m = _ACP_ERROR_TAIL_RE.search(text)
+    head = text[:m.start()] if m else text
+    head = head.strip()
+    if not head or _echo_prefix_state(head)[0]:
+        return ""
+    return head
 # A session that fails this many turns in a row is dropped, in case Cursor keeps a half-recorded prompt.
 _MAX_CONSECUTIVE_FAILED_TURNS = 3
 
@@ -1001,7 +1054,7 @@ class UpstreamTurnError(ConnectionError):
 
     def __init__(self, message: str):
         super().__init__(message)
-        self.session_intact = bool(_TRANSIENT_UPSTREAM_RE.search(message))
+        self.session_intact = "NonRetriableError" not in message and bool(_TRANSIENT_UPSTREAM_RE.search(message))
 
 
 def _safe_prefix_end(buf: str, emitted_len: int) -> int:
@@ -1057,6 +1110,10 @@ class _CursorACPStream:
                 if not no_indent:
                     break
                 if "Assistant:".startswith(no_indent) or no_indent == "Assistant:":
+                    break
+                # Hold a line that starts like Cursor's trailing "Error: ..." chunk until the turn is done: the done
+                # handler raises for a real transport error and releases it otherwise.
+                if "Error:".startswith(no_indent) or no_indent.startswith("Error:"):
                     break
                 m = _ASSISTANT_LINE_PREFIX_RE.match(tail)
                 if m:
@@ -1505,6 +1562,31 @@ def _make_client_class():
                              on_reusable: Any = None) -> tuple[str, str]:
             native = self._native_attempts()
             native.clear()
+            raw_ask = ask
+
+            def ask(text: str, images: list[dict[str, str]] | None = None) -> tuple[str, str]:
+                """``ask`` plus a bounded retry of a turn that Cursor ended with a transient error and no answer."""
+                prompt, prompt_images = text, images
+                attempt = 0
+                while True:
+                    out_text, out_reasoning = raw_ask(prompt, images=prompt_images)
+                    err = _detect_acp_error(out_text)
+                    if (err is None or attempt >= _transient_retries() or not UpstreamTurnError(err).session_intact
+                            or _answer_before_error_tail(out_text)):
+                        # An answer that was already streamed cannot be unsent, so that case goes to Hermes' retry.
+                        return out_text, out_reasoning
+                    attempt += 1
+                    wait = _transient_backoff(attempt)
+                    logger.warning("cursor-acp: model=%s turn ended with %s; retrying in this session in %.1fs (%d/%d)",
+                                   model, err, wait, attempt, _transient_retries())
+                    deadline_at = time.monotonic() + wait
+                    while time.monotonic() < deadline_at and not getattr(self, "is_closed", False):
+                        time.sleep(min(0.1, max(0.0, deadline_at - time.monotonic())))
+                    if native:
+                        # Cursor tried a native tool in the failed attempt (refused, so nothing ran): continue, don't repeat.
+                        prompt, prompt_images = _CONTINUE_NUDGE, None
+                        native.clear()
+
             text, reasoning = ask(effective_prompt, images=effective_images)
             if (acp_err := _detect_acp_error(text)) is not None:
                 raise UpstreamTurnError(acp_err)
